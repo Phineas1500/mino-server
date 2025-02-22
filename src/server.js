@@ -18,6 +18,24 @@ app.use(cors({
 
 app.use(express.json());
 
+function getPythonCommand() {
+  const venvPythonPaths = [
+    path.join(__dirname, '..', 'venv', 'bin', 'python'),
+    path.join(__dirname, '..', 'bin', 'python'),
+    path.join(__dirname, '..', 'env', 'bin', 'python'),
+    path.join(__dirname, '..', 'venv', 'Scripts', 'python.exe'),
+    path.join(__dirname, '..', 'env', 'Scripts', 'python.exe')
+  ];
+
+  for (const venvPath of venvPythonPaths) {
+    if (fs.existsSync(venvPath)) {
+      return venvPath;
+    }
+  }
+  
+  return 'python3'; // fallback to system python
+}
+
 // Configure storage
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
@@ -60,19 +78,20 @@ app.post('/upload', upload.single('video'), async (req, res) => {
     console.log('Starting transcription process...');
     console.log('Input path:', inputPath);
     
-    const pythonProcess = spawn('python3', [
+    const pythonCommand = getPythonCommand();
+    const pythonProcess = spawn(pythonCommand, [
       path.join(__dirname, 'video_processor.py'),
       inputPath,
       outputPath
     ]);
+    
 
     let pythonOutput = '';
     let pythonError = '';
 
     pythonProcess.stdout.on('data', (data) => {
       const output = data.toString();
-      console.log('Python output:', output);
-      // Append all output
+      console.log('Raw Python output:', output); // Add this line
       pythonOutput += output;
     });
 
@@ -122,6 +141,7 @@ app.post('/upload', upload.single('video'), async (req, res) => {
         }
       } catch (error) {
         console.error('Error parsing Python output:', error);
+        console.error('Raw Python output received:', pythonOutput); // Add this line
         res.status(500).json({ 
           success: false, 
           error: 'Failed to parse Python output',
@@ -140,10 +160,12 @@ app.post('/upload', upload.single('video'), async (req, res) => {
 
 // Test endpoint
 app.post('/api/transcript/test', (req, res) => {
-  const pythonProcess = spawn('python3', [
+  const pythonCommand = getPythonCommand();
+  const pythonProcess = spawn(pythonCommand, [
     path.join(__dirname, 'video_processor.py'),
     'test'
   ]);
+
 
   let outputData = '';
 

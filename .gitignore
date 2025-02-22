@@ -7,3 +7,6 @@ include
 lib
 lib64
 logs
+pyvenv.cfg
+src/uploadsbazinga
+src/__pycache__
