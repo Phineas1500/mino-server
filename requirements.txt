@@ -2,4 +2,4 @@ opencv-python==4.8.1.78
 numpy==1.26.2
 moviepy==1.0.3
 openai-whisper==20231117
-torch==2.1.2 
+torch==2.2.0 

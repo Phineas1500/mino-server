@@ -4,23 +4,24 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const cors = require('cors');
-const ffmpeg = require('fluent-ffmpeg');
 const { spawn } = require('child_process');
 
 const app = express();
 const PORT = 3001;
 
 app.use(cors({
-  origin: true,  // Allow all origins during development
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Accept', 'Authorization'],
-  credentials: false  // Change to false since we don't need cookies
+  origin: true,
+  methods: ['GET', 'POST'],
+  allowedHeaders: ['Content-Type', 'Accept'],
+  credentials: false
 }));
+
+app.use(express.json());
 
 // Configure storage
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    const uploadDir = path.join(__dirname, '..', 'uploads', 'raw');
+    const uploadDir = path.join(__dirname, '..', 'uploads');
     if (!fs.existsSync(uploadDir)) {
       fs.mkdirSync(uploadDir, { recursive: true });
     }
@@ -34,175 +35,148 @@ const storage = multer.diskStorage({
 
 const upload = multer({ storage });
 
-// Create directories for different stages
-const dirs = ['raw', 'processed', 'audio'];
-dirs.forEach(dir => {
-  const fullPath = path.join(__dirname, '..', 'uploads', dir);
-  if (!fs.existsSync(fullPath)) {
-    fs.mkdirSync(fullPath, { recursive: true });
-  }
-});
-
-// Serve processed videos
-app.use('/videos', express.static(path.join(__dirname, 'uploads', 'processed')));
-
 // Upload and process endpoint
 app.post('/upload', upload.single('video'), async (req, res) => {
   try {
-    console.log('Received upload request');
+    console.log('=== Upload Request Started ===');
+    console.log('Headers:', req.headers);
+    console.log('Body:', req.body);
 
     if (!req.file) {
-      console.log('No file received');
+      console.log('No file received in request');
       return res.status(400).json({ error: 'No file uploaded' });
     }
 
-    console.log('File received:', req.file.originalname);
+    console.log('File details:', {
+      originalname: req.file.originalname,
+      mimetype: req.file.mimetype,
+      size: req.file.size,
+      path: req.file.path
+    });
     
     const inputPath = req.file.path;
-    const filename = path.basename(inputPath);
-    const audioPath = path.join(__dirname, 'uploads', 'audio', `${filename}.wav`);
-    const outputPath = path.join(__dirname, 'uploads', 'processed', filename);
+    const outputPath = inputPath;
 
-    // Log processing steps
-    console.log('Starting audio extraction...');
-    await extractAudio(inputPath, audioPath);
-    console.log('Audio extraction complete');
-
-    console.log('Starting video processing and transcription...');
-    const result = await processVideo(inputPath, outputPath);
-    console.log('Video processing and transcription complete');
-
-    const videoUrl = `http://100.70.34.122:${PORT}/videos/${filename}`;
+    console.log('Starting transcription process...');
+    console.log('Input path:', inputPath);
     
-    // Log success
-    console.log('Processing completed successfully:', {
-      filename,
-      videoUrl
+    const pythonProcess = spawn('python3', [
+      path.join(__dirname, 'video_processor.py'),
+      inputPath,
+      outputPath
+    ]);
+
+    let pythonOutput = '';
+    let pythonError = '';
+
+    pythonProcess.stdout.on('data', (data) => {
+      const output = data.toString();
+      console.log('Python output:', output);
+      // Append all output
+      pythonOutput += output;
     });
 
-    res.json({
-      success: true,
-      url: videoUrl,
-      filename,
-      ...result.transcription_data  // This will include summary, keyPoints, flashcards, and transcript
+    pythonProcess.stderr.on('data', (data) => {
+      const error = data.toString();
+      console.log('Python error:', error);
+      pythonError += error;
+    });
+
+    pythonProcess.on('close', (code) => {
+      if (code !== 0) {
+        console.error('Python process failed with code:', code);
+        return res.status(500).json({ 
+          success: false, 
+          error: 'Failed to process video',
+          pythonError 
+        });
+      }
+
+      try {
+        // Find the last complete JSON object in the output
+        const matches = pythonOutput.match(/\{(?:[^{}]|(\{[^{}]*\}))*\}/g);
+        if (!matches) {
+          throw new Error('No valid JSON found in Python output');
+        }
+        // Take the last complete JSON object
+        const lastJson = matches[matches.length - 1];
+        const result = JSON.parse(lastJson);
+        
+        if (result.status === 'success') {
+          // Read the transcript file
+          const transcriptContent = fs.readFileSync(result.transcript_file, 'utf8');
+          
+          res.json({
+            success: true,
+            url: `http://localhost:${PORT}/video/${path.basename(inputPath)}`,
+            data: {
+              transcript: transcriptContent,
+              segments: result.segments
+            }
+          });
+        } else {
+          res.status(500).json({ 
+            success: false, 
+            error: result.error || 'Processing failed' 
+          });
+        }
+      } catch (error) {
+        console.error('Error parsing Python output:', error);
+        res.status(500).json({ 
+          success: false, 
+          error: 'Failed to parse Python output',
+          pythonOutput
+        });
+      }
     });
   } catch (error) {
-    // Detailed error logging
-    console.error('Processing error:', {
-      error: error.message,
-      stack: error.stack,
-      file: req.file?.originalname
-    });
-
-    // Send appropriate error response
+    console.error('Server error:', error);
     res.status(500).json({ 
-      error: 'Processing failed',
-      message: error.message
+      success: false, 
+      error: error.message 
     });
-  } finally {
-    // Could add cleanup here if needed
-    console.log('Request processing completed');
   }
 });
 
-function extractAudio(inputPath, outputPath) {
-  return new Promise((resolve, reject) => {
-    ffmpeg(inputPath)
-      .toFormat('wav')
-      .audioBitrate(16)
-      .audioChannels(1)
-      .audioFrequency(16000)
-      .on('end', resolve)
-      .on('error', reject)
-      .save(outputPath);
-  });
-}
+// Test endpoint
+app.post('/api/transcript/test', (req, res) => {
+  const pythonProcess = spawn('python3', [
+    path.join(__dirname, 'video_processor.py'),
+    'test'
+  ]);
 
-// Temporary function until we integrate with Whisper
-function simulateTranscription(audioPath) {
-  return new Promise(resolve => {
-    setTimeout(() => {
-      resolve({
-        segments: [
-          { start: 0, end: 30, text: "Introduction" },
-          { start: 30, end: 60, text: "Main content" },
-          // Add more segments as needed
-        ]
+  let outputData = '';
+
+  pythonProcess.stdout.on('data', (data) => {
+    outputData += data.toString();
+  });
+
+  pythonProcess.stderr.on('data', (data) => {
+    console.error(`Python Error: ${data}`);
+  });
+
+  pythonProcess.on('close', (code) => {
+    if (code !== 0) {
+      return res.status(500).json({ success: false, error: 'Failed to process test transcript' });
+    }
+    try {
+      const result = JSON.parse(outputData);
+      res.json({ 
+        success: true, 
+        data: result
       });
-    }, 1000);
+    } catch (error) {
+      res.status(500).json({ 
+        success: false, 
+        error: 'Failed to parse Python output',
+        rawOutput: outputData 
+      });
+    }
   });
-}
+});
 
-function processVideo(inputPath, outputPath, transcript) {
-  return new Promise((resolve, reject) => {
-    // First do the speed adjustment with ffmpeg
-    const tempPath = outputPath + '_temp.mp4';
-    ffmpeg(inputPath)
-      .videoFilters('setpts=0.25*PTS')  // 4x speed
-      .audioFilters('atempo=2.0,atempo=2.0')  // 4x audio speed
-      .on('end', () => {
-        // Then process with Python for transcription and enhancement
-        const pythonProcess = spawn('python3', [
-          path.join(__dirname, 'video_processor.py'),
-          tempPath,
-          outputPath,
-          JSON.stringify({
-            // Add any additional parameters here
-          })
-        ]);
-
-        let pythonOutput = '';
-        let pythonError = '';
-
-        pythonProcess.stdout.on('data', (data) => {
-          pythonOutput += data.toString();
-        });
-
-        pythonProcess.stderr.on('data', (data) => {
-          pythonError += data.toString();
-        });
-
-        pythonProcess.on('close', (code) => {
-          // Clean up temporary file
-          fs.unlink(tempPath, (err) => {
-            if (err) console.error('Error cleaning up temp file:', err);
-          });
-
-          if (code === 0) {
-            try {
-              const result = JSON.parse(pythonOutput);
-              if (result.status === 'success') {
-                // Save transcription to a file
-                const transcriptionPath = outputPath.replace(/\.[^/.]+$/, '_transcript.txt');
-                const transcriptionContent = `Full Transcription:\n=================\n\n${result.transcription.full_text}\n\nSegments with Timestamps:\n=======================\n\n${
-                  result.transcription.segments.map(seg => 
-                    `[${seg.start.toFixed(2)}s -> ${seg.end.toFixed(2)}s] ${seg.text}`
-                  ).join('\n')
-                }`;
-                
-                fs.writeFile(transcriptionPath, transcriptionContent, 'utf8', (err) => {
-                  if (err) console.error('Error saving transcription:', err);
-                });
-                
-                resolve({
-                  ...result,
-                  transcriptionPath
-                });
-              } else {
-                reject(new Error(result.error || 'Python processing failed'));
-              }
-            } catch (e) {
-              reject(new Error('Failed to parse Python output'));
-            }
-          } else {
-            reject(new Error(`Python process failed: ${pythonError}`));
-          }
-        });
-      })
-      .on('error', reject)
-      .save(tempPath);
-  });
-}
+// Serve uploaded videos
+app.use('/video', express.static(path.join(__dirname, '..', 'uploads')));
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
