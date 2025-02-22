@@ -7,3 +7,5 @@ include
 lib
 lib64
 logs
+pyvenv.cfg
+server2.js
