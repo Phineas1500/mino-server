@@ -11,13 +11,16 @@ const app = express();
 const PORT = 3001;
 
 app.use(cors({
-  origin: 'http://localhost:3000'
+  origin: true,  // Allow all origins during development
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Accept', 'Authorization'],
+  credentials: false  // Change to false since we don't need cookies
 }));
 
 // Configure storage
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    const uploadDir = path.join(__dirname, 'uploads', 'raw');
+    const uploadDir = path.join(__dirname, '..', 'uploads', 'raw');
     if (!fs.existsSync(uploadDir)) {
       fs.mkdirSync(uploadDir, { recursive: true });
     }
@@ -34,7 +37,7 @@ const upload = multer({ storage });
 // Create directories for different stages
 const dirs = ['raw', 'processed', 'audio'];
 dirs.forEach(dir => {
-  const fullPath = path.join(__dirname, 'uploads', dir);
+  const fullPath = path.join(__dirname, '..', 'uploads', dir);
   if (!fs.existsSync(fullPath)) {
     fs.mkdirSync(fullPath, { recursive: true });
   }
@@ -45,27 +48,42 @@ app.use('/videos', express.static(path.join(__dirname, 'uploads', 'processed')))
 
 // Upload and process endpoint
 app.post('/upload', upload.single('video'), async (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ error: 'No file uploaded' });
-  }
-
-  const inputPath = req.file.path;
-  const filename = path.basename(inputPath);
-  const audioPath = path.join(__dirname, 'uploads', 'audio', `${filename}.wav`);
-  const outputPath = path.join(__dirname, 'uploads', 'processed', filename);
-
   try {
-    // Extract audio for transcription
+    console.log('Received upload request');
+
+    if (!req.file) {
+      console.log('No file received');
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    console.log('File received:', req.file.originalname);
+    
+    const inputPath = req.file.path;
+    const filename = path.basename(inputPath);
+    const audioPath = path.join(__dirname, 'uploads', 'audio', `${filename}.wav`);
+    const outputPath = path.join(__dirname, 'uploads', 'processed', filename);
+
+    // Log processing steps
+    console.log('Starting audio extraction...');
     await extractAudio(inputPath, audioPath);
+    console.log('Audio extraction complete');
 
-    // TODO: Send audio to whisper for transcription
-    // For now, let's simulate transcription
+    console.log('Starting transcription...');
     const transcript = await simulateTranscription(audioPath);
+    console.log('Transcription complete');
 
-    // Process video based on transcript
+    console.log('Starting video processing...');
     await processVideo(inputPath, outputPath, transcript);
+    console.log('Video processing complete');
 
     const videoUrl = `http://100.70.34.122:${PORT}/videos/${filename}`;
+    
+    // Log success
+    console.log('Processing completed successfully:', {
+      filename,
+      videoUrl
+    });
+
     res.json({
       success: true,
       url: videoUrl,
@@ -73,8 +91,21 @@ app.post('/upload', upload.single('video'), async (req, res) => {
       transcript
     });
   } catch (error) {
-    console.error('Processing error:', error);
-    res.status(500).json({ error: 'Processing failed' });
+    // Detailed error logging
+    console.error('Processing error:', {
+      error: error.message,
+      stack: error.stack,
+      file: req.file?.originalname
+    });
+
+    // Send appropriate error response
+    res.status(500).json({ 
+      error: 'Processing failed',
+      message: error.message
+    });
+  } finally {
+    // Could add cleanup here if needed
+    console.log('Request processing completed');
   }
 });
 

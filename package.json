@@ -2,14 +2,18 @@
   "name": "mino-server",
   "version": "1.0.0",
   "description": "Video processing server for Mino",
-  "main": "server.js",
+  "main": "src/server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "nodemon server.js",
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
     "setup": "mkdir -p uploads/raw uploads/processed uploads/audio",
     "clean": "rm -rf uploads/raw/* uploads/processed/* uploads/audio/*"
   },
-  "keywords": ["video", "processing", "ffmpeg"],
+  "keywords": [
+    "video",
+    "processing",
+    "ffmpeg"
+  ],
   "author": "",
   "license": "ISC",
   "dependencies": {
@@ -20,6 +24,6 @@
     "multer": "^1.4.5-lts.1"
   },
   "devDependencies": {
-    "nodemon": "^3.0.3"
+    "nodemon": "^3.1.9"
   }
 }
