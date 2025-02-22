@@ -33,6 +33,7 @@ multidict==6.1.0
 networkx==3.4.2
 numba==0.61.0
 numpy==1.26.2
+openai
 openai-whisper==20231117
 opencv-python==4.8.1.78
 pillow==11.1.0
