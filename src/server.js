@@ -68,13 +68,9 @@ app.post('/upload', upload.single('video'), async (req, res) => {
     await extractAudio(inputPath, audioPath);
     console.log('Audio extraction complete');
 
-    console.log('Starting transcription...');
-    const transcript = await simulateTranscription(audioPath);
-    console.log('Transcription complete');
-
-    console.log('Starting video processing...');
-    await processVideo(inputPath, outputPath, transcript);
-    console.log('Video processing complete');
+    console.log('Starting video processing and transcription...');
+    const result = await processVideo(inputPath, outputPath);
+    console.log('Video processing and transcription complete');
 
     const videoUrl = `http://100.70.34.122:${PORT}/videos/${filename}`;
     
@@ -88,7 +84,7 @@ app.post('/upload', upload.single('video'), async (req, res) => {
       success: true,
       url: videoUrl,
       filename,
-      transcript
+      ...result.transcription_data  // This will include summary, keyPoints, flashcards, and transcript
     });
   } catch (error) {
     // Detailed error logging
@@ -139,13 +135,72 @@ function simulateTranscription(audioPath) {
 
 function processVideo(inputPath, outputPath, transcript) {
   return new Promise((resolve, reject) => {
-    // For now, just speed up the entire video
-    // TODO: Implement smart speed adjustment based on transcript
+    // First do the speed adjustment with ffmpeg
+    const tempPath = outputPath + '_temp.mp4';
     ffmpeg(inputPath)
-      .videoFilters('setpts=0.5*PTS')
-      .on('end', resolve)
+      .videoFilters('setpts=0.25*PTS')  // 4x speed
+      .audioFilters('atempo=2.0,atempo=2.0')  // 4x audio speed
+      .on('end', () => {
+        // Then process with Python for transcription and enhancement
+        const pythonProcess = spawn('python3', [
+          path.join(__dirname, 'video_processor.py'),
+          tempPath,
+          outputPath,
+          JSON.stringify({
+            // Add any additional parameters here
+          })
+        ]);
+
+        let pythonOutput = '';
+        let pythonError = '';
+
+        pythonProcess.stdout.on('data', (data) => {
+          pythonOutput += data.toString();
+        });
+
+        pythonProcess.stderr.on('data', (data) => {
+          pythonError += data.toString();
+        });
+
+        pythonProcess.on('close', (code) => {
+          // Clean up temporary file
+          fs.unlink(tempPath, (err) => {
+            if (err) console.error('Error cleaning up temp file:', err);
+          });
+
+          if (code === 0) {
+            try {
+              const result = JSON.parse(pythonOutput);
+              if (result.status === 'success') {
+                // Save transcription to a file
+                const transcriptionPath = outputPath.replace(/\.[^/.]+$/, '_transcript.txt');
+                const transcriptionContent = `Full Transcription:\n=================\n\n${result.transcription.full_text}\n\nSegments with Timestamps:\n=======================\n\n${
+                  result.transcription.segments.map(seg => 
+                    `[${seg.start.toFixed(2)}s -> ${seg.end.toFixed(2)}s] ${seg.text}`
+                  ).join('\n')
+                }`;
+                
+                fs.writeFile(transcriptionPath, transcriptionContent, 'utf8', (err) => {
+                  if (err) console.error('Error saving transcription:', err);
+                });
+                
+                resolve({
+                  ...result,
+                  transcriptionPath
+                });
+              } else {
+                reject(new Error(result.error || 'Python processing failed'));
+              }
+            } catch (e) {
+              reject(new Error('Failed to parse Python output'));
+            }
+          } else {
+            reject(new Error(`Python process failed: ${pythonError}`));
+          }
+        });
+      })
       .on('error', reject)
-      .save(outputPath);
+      .save(tempPath);
   });
 }
 
