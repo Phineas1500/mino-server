@@ -1,22 +1,34 @@
-from modal import Image, Mount, App
+from modal import Image, Mount, App, Secret
 import whisper
 from pathlib import Path
 import json
 import traceback
-import soundfile as sf  # Add this for audio file validation
+import soundfile as sf
+import sys
+import os
+import openai
 
 app = App("whisper-transcription")
 
 # Update image to include soundfile and its dependencies
 image = (
     Image.debian_slim()
-    .apt_install("ffmpeg", "libsndfile1")  # Add libsndfile1
+    .apt_install("ffmpeg", "libsndfile1")
     .pip_install(
         "openai-whisper",
         "ffmpeg-python",
-        "soundfile"  # Add soundfile
+        "soundfile",
+        "openai"
     )
 )
+
+# Configure OpenAI client for DeepSeek
+def get_openai_client():
+    client = openai.OpenAI(
+        api_key=os.environ["OPENAI_API_KEY"],
+        base_url="https://api.deepseek.com"
+    )
+    return client
 
 @app.function(gpu="T4", image=image)
 def transcribe_audio(audio_data: bytes, filename: str):
@@ -56,7 +68,6 @@ def transcribe_audio(audio_data: bytes, filename: str):
         model = whisper.load_model("base")
         print("Model loaded, starting transcription...")
         
-        # Use Whisper's built-in audio loading with more verbose output
         result = model.transcribe(
             str(temp_path),
             verbose=True,
@@ -82,5 +93,53 @@ def transcribe_audio(audio_data: bytes, filename: str):
             "traceback": traceback.format_exc()
         }
 
+@app.function(
+    secrets=[Secret.from_name("openai-secret")],
+    timeout=1800
+)
+def process_transcript(transcript: str):
+    """Process transcript with DeepSeek to generate summary and flashcards"""
+    try:
+        # Initialize DeepSeek client
+        client = get_openai_client()
+        
+        # Generate summary
+        summary_prompt = f"""Please analyze this transcript and provide:
+        1. A concise summary (2-3 paragraphs)
+        2. 3-5 key points
+        3. 5 flashcards in Q&A format
+        
+        Transcript:
+        {transcript}
+        
+        Format the response as JSON with the following structure:
+        {{
+            "summary": "...",
+            "keyPoints": ["point1", "point2", ...],
+            "flashcards": [
+                {{"question": "...", "answer": "..."}}
+            ]
+        }}
+        """
+        
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant that creates educational content from video transcripts."},
+                {"role": "user", "content": summary_prompt}
+            ],
+            stream=False
+        )
+        
+        return json.loads(response.choices[0].message.content)
+        
+    except Exception as e:
+        sys.stderr.write(f"Error in process_transcript: {str(e)}\n")
+        sys.stderr.write(traceback.format_exc())
+        return {
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
+
 if __name__ == "__main__":
-    app.serve()
+    app.serve() 
