@@ -298,7 +298,8 @@ async def process_video(video_data: bytes, filename: str):
 
             # Transcribe with Whisper
             log("Loading Whisper model...")
-            model = whisper.load_model("base")
+            # Use tiny model instead of base for faster processing
+            model = whisper.load_model("tiny")
             
             log("Starting transcription...")
             result = model.transcribe(
@@ -326,7 +327,7 @@ async def process_video(video_data: bytes, filename: str):
 
             content_prompt = f"""Analyze this lecture transcript and provide a response in this EXACT JSON format:
             {{
-                "summary": "A clear 2-3 paragraph summary of the main concepts. 1.) Analyze the input text and generate 5 essential questions that, when answered, capture the main points and core meaning of the text. 2.) When formulating your questions: a. Address the central theme or argument b. Identify key supporting ideas c. Highlight important facts or evidence d. Reveal the author's purpose or perspective e. Explore any significant implications or conclusions. 3.) Answer all of your generated questions one-by-one in detail.",
+                "summary": "A clear 2-3 paragraph summary of the main concepts",
                 "keyPoints": [
                     "First key point as a complete sentence",
                     "Second key point as a complete sentence",
@@ -358,18 +359,8 @@ async def process_video(video_data: bytes, filename: str):
                 ]
             }}
 
-            The response MUST:
-            1. Include a detailed summary that captures the main ideas
-            2. Have exactly 5 key points as complete sentences
-            3. Have exactly 5 flashcards with clear questions and answers, where:
-               - First 3 cards test basic understanding of explicit content
-               - Fourth card requires connecting multiple concepts
-               - Fifth card tests ability to make inferences or applications
-            4. Be in valid JSON format
-
-            Here is the transcript to analyze:
-            {transcript}
-            """
+            The response MUST be in valid JSON format.
+            Here is the transcript: {transcript}"""
 
             log("Generating educational content with OpenAI...")
             content_response = client.chat.completions.create(
@@ -377,7 +368,7 @@ async def process_video(video_data: bytes, filename: str):
                 messages=[
                     {
                         "role": "system",
-                        "content": "You are a helpful assistant that creates educational content from video transcripts. You MUST return responses in valid JSON format with the exact structure specified. For flashcards, create a progression from basic recall to advanced synthesis and application."
+                        "content": "You are a helpful assistant that creates educational content from video transcripts. You MUST return responses in valid JSON format with the exact structure specified."
                     },
                     {
                         "role": "user",
@@ -385,7 +376,7 @@ async def process_video(video_data: bytes, filename: str):
                     }
                 ],
                 temperature=0.7,
-                max_tokens=3000,
+                max_tokens=2000,
                 response_format={ "type": "json_object" }
             )
 
@@ -393,15 +384,20 @@ async def process_video(video_data: bytes, filename: str):
             content_data = json.loads(content_response.choices[0].message.content)
             log("Successfully generated educational content")
 
-            # Process segments for skippability
+            # Process segments in batches for faster analysis
             log("Analyzing segments for importance ratings...")
             analyzed_segments = []
             total_duration = 0
             skippable_duration = 0
-
-            for i, segment in enumerate(segments):
+            
+            # Process segments in batches of 5
+            batch_size = 5
+            for i in range(0, len(segments), batch_size):
+                batch = segments[i:i + batch_size]
+                batch_texts = [seg["text"] for seg in batch]
+                
                 try:
-                    importance_prompt = f"""Rate this lecture segment's importance on a scale of 1-10 and explain why. Be extra lenient with the rating. We want to be able to skip as much content as possible.
+                    importance_prompt = f"""Rate each lecture segment's importance in context of the entire lecture on a scale of 1-10 and explain why. Be extra lenient with the rating.
 
                     Guidelines:
                     10 = Crucial concept, key definition, or fundamental principle
@@ -409,12 +405,18 @@ async def process_video(video_data: bytes, filename: str):
                     4-6 = Supporting information, context, or basic examples
                     1-3 = Repetitive information, tangents, or very basic content
 
-                    Segment: "{segment['text']}"
+                    Segments to analyze:
+                    {json.dumps(batch_texts)}
 
-                    Respond in JSON format:
+                    Respond in JSON format with an array of ratings:
                     {{
-                        "importance_score": <number 1-10>,
-                        "reason": "Brief explanation of the rating"
+                        "ratings": [
+                            {{
+                                "importance_score": <number 1-10>,
+                                "reason": "Brief explanation"
+                            }},
+                            ...
+                        ]
                     }}"""
 
                     importance_response = client.chat.completions.create(
@@ -430,45 +432,46 @@ async def process_video(video_data: bytes, filename: str):
                             }
                         ],
                         temperature=0.3,
-                        max_tokens=100,
+                        max_tokens=500,
                         response_format={ "type": "json_object" }
                     )
 
                     analysis = json.loads(importance_response.choices[0].message.content)
                     
-                    segment_duration = segment["end"] - segment["start"]
-                    total_duration += segment_duration
+                    for seg, rating in zip(batch, analysis["ratings"]):
+                        segment_duration = seg["end"] - seg["start"]
+                        total_duration += segment_duration
+                        
+                        importance_score = max(1, min(10, float(rating["importance_score"])))
+                        can_skip = importance_score < 4
+                        
+                        if can_skip:
+                            skippable_duration += segment_duration
+                        
+                        analyzed_segments.append({
+                            "start": seg["start"],
+                            "end": seg["end"],
+                            "text": seg["text"],
+                            "can_skip": can_skip,
+                            "importance_score": importance_score,
+                            "reason": rating["reason"]
+                        })
                     
-                    # Normalize importance score between 1 and 10
-                    importance_score = max(1, min(10, float(analysis["importance_score"])))
-                    
-                    # Consider segments with importance < 4 as skippable
-                    can_skip = importance_score < 4
-                    if can_skip:
-                        skippable_duration += segment_duration
-                    
-                    analyzed_segments.append({
-                        "start": segment["start"],
-                        "end": segment["end"],
-                        "text": segment["text"],
-                        "can_skip": can_skip,
-                        "importance_score": importance_score,
-                        "reason": analysis["reason"]
-                    })
-                    
-                    log(f"Processed segment {i+1}/{len(segments)}: Score={importance_score}/10")
+                    log(f"Processed batch {i//batch_size + 1}/{(len(segments) + batch_size - 1)//batch_size}")
 
                 except Exception as e:
-                    log(f"Error analyzing segment {i+1}: {str(e)}", "WARNING")
-                    analyzed_segments.append({
-                        "start": segment["start"],
-                        "end": segment["end"],
-                        "text": segment["text"],
-                        "can_skip": False,
-                        "importance_score": 5,
-                        "reason": "Error in analysis"
-                    })
-                    total_duration += segment["end"] - segment["start"]
+                    log(f"Error analyzing batch starting at segment {i}: {str(e)}", "WARNING")
+                    # Handle failed batch with default values
+                    for seg in batch:
+                        analyzed_segments.append({
+                            "start": seg["start"],
+                            "end": seg["end"],
+                            "text": seg["text"],
+                            "can_skip": False,
+                            "importance_score": 5,
+                            "reason": "Error in batch analysis"
+                        })
+                        total_duration += seg["end"] - seg["start"]
 
             # Calculate statistics
             skippable_segments = [s for s in analyzed_segments if s["can_skip"]]
