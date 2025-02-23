@@ -8,49 +8,38 @@ from modal import Function
 
 def process_video(input_path, output_path):
     """
-    Extract audio and send to Modal for transcription and summarization
+    Process video and send to Modal for transcription, summarization, and cutting
     """
     try:
         sys.stderr.write(f"Starting process_video with input: {input_path}\n")
         input_path = Path(input_path)
         
-        sys.stderr.write("Extracting audio...\n")
-        video = mp.VideoFileClip(str(input_path))
-        temp_audio_path = input_path.with_suffix('.wav')
-        video.audio.write_audiofile(
-            str(temp_audio_path),
-            codec='pcm_s16le',
-            ffmpeg_params=["-ac", "1"],  # Convert to mono
-            fps=16000,  # Use 16kHz sampling rate
-            logger=None
-        )
-        video.close()
-
-        sys.stderr.write(f"Audio file created at: {temp_audio_path}\n")
-        sys.stderr.write(f"Audio file exists: {os.path.exists(temp_audio_path)}\n")
-        sys.stderr.write(f"Audio file size: {os.path.getsize(temp_audio_path)} bytes\n")
-
-        sys.stderr.write("Reading audio file for Modal...\n")
-        with open(temp_audio_path, 'rb') as audio_file:
-            audio_data = audio_file.read()
-        sys.stderr.write(f"Read {len(audio_data)} bytes of audio data\n")
+        # Read the video file
+        sys.stderr.write("Reading video file for Modal...\n")
+        with open(input_path, 'rb') as video_file:
+            video_data = video_file.read()
+        sys.stderr.write(f"Read {len(video_data)} bytes of video data\n")
         
         sys.stderr.write("Connecting to Modal service...\n")
         modal_fn = Function.lookup("whisper-transcription", "process_video")
         
-        sys.stderr.write("Sending to Modal for processing...\n")
-        result = modal_fn.remote(audio_data, temp_audio_path.name)
-        sys.stderr.write(f"Received result from Modal\n")
-        
-        # Clean up temporary audio file
-        if os.path.exists(temp_audio_path):
-            os.remove(temp_audio_path)
-            sys.stderr.write("Cleaned up temporary audio file\n")
+        # Just send the video data and filename without path
+        filename = input_path.name
+        sys.stderr.write(f"Sending to Modal for processing with filename: {filename}\n")
+        result = modal_fn.remote(video_data, filename)
+        sys.stderr.write("Received result from Modal\n")
 
         # Write transcript to file
         transcript_path = input_path.with_suffix('.txt')
         with open(transcript_path, 'w', encoding='utf-8') as f:
             f.write(result["transcript"])
+            
+        # Write shortened video to file if it exists
+        if "shortened_video" in result:
+            shortened_path = input_path.with_stem(f"{input_path.stem}_shortened")
+            with open(shortened_path, 'wb') as f:
+                f.write(result["shortened_video"])
+            sys.stderr.write(f"Saved shortened video to: {shortened_path}\n")
         
         output = {
             "status": "success",
@@ -58,14 +47,8 @@ def process_video(input_path, output_path):
             "summary": result["summary"],
             "keyPoints": result["keyPoints"],
             "flashcards": result["flashcards"],
-            "segments": [
-                {
-                    "start": s["start"],
-                    "end": s["end"],
-                    "text": s["text"]
-                }
-                for s in result["segments"]
-            ]
+            "segments": result["segments"],
+            "shortened_video_path": str(shortened_path) if "shortened_video" in result else None
         }
         
         sys.stderr.write("Processing completed successfully\n")
@@ -82,6 +65,7 @@ def process_video(input_path, output_path):
         }
         print(json.dumps(error_output, ensure_ascii=False))
         sys.stdout.flush()
+        raise
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:

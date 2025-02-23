@@ -7,7 +7,7 @@ const path = require('path');
 const fs = require('fs');
 const cors = require('cors');
 const { spawn } = require('child_process');
-const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { S3Client, GetObjectCommand, PutObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { generatePresignedUrl, s3Client } = require('./services/s3');
 const { promises: fsPromises } = require('fs');
@@ -231,10 +231,11 @@ app.post('/process/s3-video', async (req, res) => {
     const tempDir = path.join(__dirname, '..', 'temp');
     await fsPromises.mkdir(tempDir, { recursive: true });
 
-    // Download file from S3
+    // Set up path for original video
     localPath = path.join(tempDir, path.basename(fileKey));
     
-    const command = new GetObjectCommand({
+    // Download original video from S3
+    const getCommand = new GetObjectCommand({
       Bucket: process.env.AWS_BUCKET_NAME,
       Key: fileKey
     });
@@ -244,14 +245,14 @@ app.post('/process/s3-video', async (req, res) => {
       key: fileKey
     });
 
-    const response = await s3Client.send(command);
+    const response = await s3Client.send(getCommand);
     const readStream = response.Body;
 
     if (!readStream) {
       throw new Error('Failed to get video stream from S3');
     }
 
-    // Write the file locally
+    // Write the original video locally
     const writeStream = await fsPromises.open(localPath, 'w');
     const chunks = [];
     for await (const chunk of readStream) {
@@ -262,12 +263,12 @@ app.post('/process/s3-video', async (req, res) => {
 
     console.log('Downloaded file from S3 to:', localPath);
 
-    // Process the video using existing video_processor.py
+    // Process the video using video_processor.py
     const pythonCommand = getPythonCommand();
     const pythonProcess = spawn(pythonCommand, [
       path.join(__dirname, 'video_processor.py'),
       localPath,
-      localPath
+      localPath  // Use same path, Python will append _shortened
     ]);
 
     let pythonOutput = '';
@@ -311,22 +312,40 @@ app.post('/process/s3-video', async (req, res) => {
                 console.warn('Could not read transcript file:', err);
               }
             }
+
+            // Upload shortened video to S3 if it exists
+            const shortenedKey = `shortened/${path.basename(fileKey)}`;
+            if (result.shortened_video_path && await fsPromises.access(result.shortened_video_path).then(() => true).catch(() => false)) {
+              await s3Client.send(new PutObjectCommand({
+                Bucket: process.env.AWS_BUCKET_NAME,
+                Key: shortenedKey,
+                Body: await fsPromises.readFile(result.shortened_video_path)
+              }));
+              console.log('Uploaded shortened video to S3:', shortenedKey);
+            }
             
-            // Generate a signed URL for accessing the processed video
+            // Generate signed URLs for both videos
             const videoCommand = new GetObjectCommand({
               Bucket: process.env.AWS_BUCKET_NAME,
               Key: fileKey
             });
-            
-            const videoUrl = await getSignedUrl(s3Client, videoCommand, {
-              expiresIn: 3600 // URL expires in 1 hour
-            });
 
-            console.log('Generated signed URL for video:', videoUrl);
+            const shortenedVideoCommand = new GetObjectCommand({
+              Bucket: process.env.AWS_BUCKET_NAME,
+              Key: shortenedKey
+            });
+            
+            const [originalUrl, shortenedUrl] = await Promise.all([
+              getSignedUrl(s3Client, videoCommand, { expiresIn: 3600 }),
+              getSignedUrl(s3Client, shortenedVideoCommand, { expiresIn: 3600 })
+            ]);
+
+            console.log('Generated signed URLs for videos');
 
             res.json({
               success: true,
-              url: videoUrl,
+              originalUrl: originalUrl,
+              shortenedUrl: shortenedUrl,
               data: {
                 transcript: transcriptContent,
                 segments: result.segments || [],
@@ -353,12 +372,21 @@ app.post('/process/s3-video', async (req, res) => {
   } finally {
     // Clean up temporary files
     try {
+      // Clean up original video file
       if (localPath) {
         await fsPromises.unlink(localPath).catch(err => 
-          console.error('Error removing video temp file:', err)
+          console.error('Error removing original video temp file:', err)
         );
       }
       
+      // Clean up shortened video using the path from Python output
+      if (result?.shortened_video_path) {
+        await fsPromises.unlink(result.shortened_video_path).catch(err => 
+          console.error('Error removing shortened video temp file:', err)
+        );
+      }
+      
+      // Clean up transcript file
       if (result?.transcript_file) {
         await fsPromises.unlink(result.transcript_file).catch(err => 
           console.error('Error removing transcript temp file:', err)
