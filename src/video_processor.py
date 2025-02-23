@@ -53,21 +53,50 @@ def process_video(input_path, output_path):
             sys.stderr.write("Cleaned up temporary audio file\n")
 
         # Write transcript
-        transcript_path = input_path.with_suffix('.txt')
+        transcript_path = input_path.with_suffix('.html')
         with open(transcript_path, 'w', encoding='utf-8') as f:
-            f.write("Full Transcription:\n")
-            f.write("=================\n\n")
-            f.write(result["transcript"])
-            f.write("\n\n")
+            # f.write("Full Transcription:\n")
+            # f.write("=======+=========\n\n")
+            # f.write(result["transcript"])
+            # f.write("\n\n")
 
             
-            f.write("Segments with Timestamps:\n")
-            f.write("=======================\n\n")
+            # f.write("Segments with Timestamps:\n")
+            # f.write("=======================\n<br>")
+            # segments_text = []
+            # for segment in result["segments"]:
+            #     text = f"[{segment['start']:.2f}s -> {segment['end']:.2f}s] {segment['text']}\n"
+            #     segments_text.append(text)
+            #     f.write("\n" + text + "<br>")
+
+            # f.write("""<!DOCTYPE html>
+            #     <html lang="en">
+            #     <head>
+            #         <meta charset="UTF-8">
+            #         <title>Transcript</title>
+            #         <style>
+            #             body { font-family: Arial, sans-serif; }
+            #             pre { white-space: pre-wrap; }
+            #         </style>
+            #     </head>
+            #     <body>
+            #         <h2>Segments with Timestamps:</h2>
+            #         <hr>
+            #         <pre>
+            #     """)
+            # f.write("<html><body>\n")
+            # f.write("<h2>Segments with Timestamps:</h2>\n")
+            # f.write("<hr>\n")
             segments_text = []
             for segment in result["segments"]:
-                text = f"[{segment['start']:.2f}s -> {segment['end']:.2f}s] {segment['text']}"
+                text = f"[{segment['start']:.2f}s -> {segment['end']:.2f}s] {segment['text']}\n"
                 segments_text.append(text)
-                f.write(text + "\n")
+                f.write(text)
+            # f.write("</body></html>")
+            # f.write("""    </pre>
+            #     </body>
+            #     </html>
+            #     """)
         
         output = {
             "status": "success",
