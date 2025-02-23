@@ -8,13 +8,12 @@ from modal import Function
 
 def process_video(input_path, output_path):
     """
-    Extract audio and send to Modal for transcription
+    Extract audio and send to Modal for transcription and summarization
     """
     try:
         sys.stderr.write(f"Starting process_video with input: {input_path}\n")
         input_path = Path(input_path)
         
-        # In the process_video function, after creating WAV file:
         sys.stderr.write("Extracting audio...\n")
         video = mp.VideoFileClip(str(input_path))
         temp_audio_path = input_path.with_suffix('.wav')
@@ -27,7 +26,6 @@ def process_video(input_path, output_path):
         )
         video.close()
 
-        # Add these debug checks:
         sys.stderr.write(f"Audio file created at: {temp_audio_path}\n")
         sys.stderr.write(f"Audio file exists: {os.path.exists(temp_audio_path)}\n")
         sys.stderr.write(f"Audio file size: {os.path.getsize(temp_audio_path)} bytes\n")
@@ -38,70 +36,36 @@ def process_video(input_path, output_path):
         sys.stderr.write(f"Read {len(audio_data)} bytes of audio data\n")
         
         sys.stderr.write("Connecting to Modal service...\n")
-        transcribe_fn = Function.lookup("whisper-transcription", "transcribe_audio")
+        modal_fn = Function.lookup("whisper-transcription", "process_video")
         
-        sys.stderr.write("Sending to Modal for transcription...\n")
-        result = transcribe_fn.remote(audio_data, temp_audio_path.name)
-        sys.stderr.write(f"Received result from Modal: {result}\n")
-        
-        if result.get("status") == "error":
-            raise Exception(f"Modal transcription failed: {result.get('error')}")
+        sys.stderr.write("Sending to Modal for processing...\n")
+        result = modal_fn.remote(audio_data, temp_audio_path.name)
+        sys.stderr.write(f"Received result from Modal\n")
         
         # Clean up temporary audio file
         if os.path.exists(temp_audio_path):
             os.remove(temp_audio_path)
             sys.stderr.write("Cleaned up temporary audio file\n")
 
-        # Write transcript
-        transcript_path = input_path.with_suffix('.html')
+        # Write transcript to file
+        transcript_path = input_path.with_suffix('.txt')
         with open(transcript_path, 'w', encoding='utf-8') as f:
-            # f.write("Full Transcription:\n")
-            # f.write("=======+=========\n\n")
-            # f.write(result["transcript"])
-            # f.write("\n\n")
-
-            
-            # f.write("Segments with Timestamps:\n")
-            # f.write("=======================\n<br>")
-            # segments_text = []
-            # for segment in result["segments"]:
-            #     text = f"[{segment['start']:.2f}s -> {segment['end']:.2f}s] {segment['text']}\n"
-            #     segments_text.append(text)
-            #     f.write("\n" + text + "<br>")
-
-            # f.write("""<!DOCTYPE html>
-            #     <html lang="en">
-            #     <head>
-            #         <meta charset="UTF-8">
-            #         <title>Transcript</title>
-            #         <style>
-            #             body { font-family: Arial, sans-serif; }
-            #             pre { white-space: pre-wrap; }
-            #         </style>
-            #     </head>
-            #     <body>
-            #         <h2>Segments with Timestamps:</h2>
-            #         <hr>
-            #         <pre>
-            #     """)
-            # f.write("<html><body>\n")
-            # f.write("<h2>Segments with Timestamps:</h2>\n")
-            # f.write("<hr>\n")
-            segments_text = []
-            for segment in result["segments"]:
-                text = f"[{segment['start']:.2f}s -> {segment['end']:.2f}s] {segment['text']}\n"
-                segments_text.append(text)
-                f.write(text)
-            # f.write("</body></html>")
-            # f.write("""    </pre>
-            #     </body>
-            #     </html>
-            #     """)
+            f.write(result["transcript"])
         
         output = {
             "status": "success",
             "transcript_file": str(transcript_path),
-            "segments": segments_text
+            "summary": result["summary"],
+            "keyPoints": result["keyPoints"],
+            "flashcards": result["flashcards"],
+            "segments": [
+                {
+                    "start": s["start"],
+                    "end": s["end"],
+                    "text": s["text"]
+                }
+                for s in result["segments"]
+            ]
         }
         
         sys.stderr.write("Processing completed successfully\n")

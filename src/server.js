@@ -160,7 +160,10 @@ app.post('/upload', upload.single('video'), async (req, res) => {
             url: `http://localhost:${PORT}/video/${path.basename(inputPath)}`,
             data: {
               transcript: transcriptContent,
-              segments: result.segments
+              segments: result.segments,
+              summary: result.summary,
+              keyPoints: result.keyPoints,
+              flashcards: result.flashcards
             }
           });
         } else {
@@ -326,7 +329,10 @@ app.post('/process/s3-video', async (req, res) => {
               url: videoUrl,
               data: {
                 transcript: transcriptContent,
-                segments: result.segments || []
+                segments: result.segments || [],
+                summary: result.summary,
+                keyPoints: result.keyPoints,
+                flashcards: result.flashcards
               }
             });
             resolve();

@@ -1,279 +1,164 @@
-from modal import Image, Mount, App, Secret
+from modal import Image, Secret, App
 import whisper
-from pathlib import Path
 import json
-import traceback
-import soundfile as sf
-import sys
 import os
 import openai
 import time
-import requests
+from pathlib import Path
 
+# Create a Modal app
 app = App("whisper-transcription")
 
-# Update image to include soundfile and its dependencies
+def log(message: str, level: str = "INFO") -> None:
+    """Helper function for consistent logging"""
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [{level}] {message}")
+
+# Define the container image with all necessary dependencies
 image = (
-    Image.debian_slim()
+    Image.debian_slim(python_version="3.11")
     .apt_install(
         "ffmpeg",
-        "libsndfile1",
         "git",
-        "python3-pip"
+        "python3-pip",
+        "build-essential",
+        "python3-dev"
     )
     .pip_install(
-        "git+https://github.com/openai/whisper.git",
-        "ffmpeg-python",
-        "soundfile",
-        "openai",
-        "numpy",
         "torch",
+        "numpy",
+        "ffmpeg-python",
+        "openai",
         "tqdm"
+    )
+    .run_commands(
+        "pip install git+https://github.com/openai/whisper.git"
     )
 )
 
-def log_to_modal(message, level="INFO"):
-    """Helper function to format logs for Modal"""
-    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
-    print(f"[{timestamp}] [{level}] {message}")
-
 @app.function(
-    gpu="T4",
+    gpu="T4",  # Request T4 GPU for faster transcription
     image=image,
-    timeout=1800
+    timeout=1800,
+    secrets=[Secret.from_name("openai-secret")]
 )
-def transcribe_audio(audio_data: bytes, filename: str):
+async def process_video(audio_data: bytes, filename: str):
+    """Main function that handles both transcription and summarization"""
     try:
-        print("Starting Modal transcription function")
-        print(f"Received filename: {filename}")
-        print(f"Received audio data size: {len(audio_data)} bytes")
-        
-        # Save the uploaded audio content temporarily
-        temp_path = Path(f"/tmp/{filename}")
+        # Step 1: Save audio data temporarily
+        temp_path = Path("/tmp") / filename
         temp_path.write_bytes(audio_data)
-        print(f"Saved audio to: {temp_path}")
-        print(f"File exists: {temp_path.exists()}")
-        print(f"File size: {temp_path.stat().st_size} bytes")
-        
-        # Add FFmpeg check for audio file
-        import subprocess
-        try:
-            ffprobe_cmd = ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type", "-of", "default=noprint_wrappers=1", str(temp_path)]
-            probe_output = subprocess.check_output(ffprobe_cmd, stderr=subprocess.STDOUT).decode()
-            print(f"FFprobe output: {probe_output}")
-        except subprocess.CalledProcessError as e:
-            print(f"FFprobe error: {e.output.decode()}")
+        log(f"Saved audio file: {temp_path} ({len(audio_data)} bytes)")
 
-        # Validate audio file
-        try:
-            data, samplerate = sf.read(str(temp_path))
-            print(f"Audio file validated: {samplerate}Hz, shape: {data.shape}")
-            print(f"Audio duration: {len(data)/samplerate:.2f} seconds")
-            print(f"Audio min/max values: {data.min():.2f}/{data.max():.2f}")
-        except Exception as e:
-            print(f"Audio validation error: {str(e)}")
-            raise ValueError(f"Invalid audio file: {str(e)}")
-        
-        # Load model and transcribe
-        print("Loading Whisper model...")
+        # Step 2: Transcribe with Whisper
+        log("Loading Whisper model...")
         model = whisper.load_model("base")
-        print("Model loaded, starting transcription...")
         
+        log("Starting transcription...")
         result = model.transcribe(
             str(temp_path),
-            verbose=True,
             language='en',
-            task='transcribe'
+            verbose=False
         )
-        
-        print(f"Transcription completed. Text length: {len(result['text'])}")
-        print(f"Number of segments: {len(result['segments'])}")
-        print(f"First few characters of transcript: {result['text'][:100]}")
-        
-        return {
-            "status": "success",
-            "transcript": result["text"],
-            "segments": result["segments"]
-        }
-    except Exception as e:
-        print(f"Error in Modal function: {str(e)}")
-        print(f"Full traceback: {traceback.format_exc()}")
-        return {
-            "status": "error",
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }
+        transcript = result["text"]
+        segments = result["segments"]
+        log(f"Transcription complete: {len(transcript)} characters")
 
-@app.function(
-    secrets=[Secret.from_name("openai-secret")],
-    timeout=1800,
-    image=image
-)
-def process_transcript(transcript: str):
-    """Process transcript with OpenAI to generate summary and flashcards"""
-    try:
-        log_to_modal("Starting transcript processing...")
-        log_to_modal(f"Transcript length: {len(transcript)} characters")
-        
-        # Initialize OpenAI client
-        client = get_openai_client()
-        
-        # Generate summary
-        summary_prompt = f"""Please analyze this transcript and provide:
-        1. A concise summary (2-3 paragraphs)
-        2. 3-5 key points
-        3. 5 flashcards in Q&A format
-        
-        Transcript:
+        # Clean up the temporary file
+        temp_path.unlink()
+        log("Cleaned up temporary audio file")
+
+        # Step 3: Process with OpenAI
+        log("Initializing OpenAI client...")
+        client = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+        prompt = f"""Analyze this lecture transcript and provide a response in this EXACT JSON format:
+        {{
+            "summary": "A clear 2-3 paragraph summary of the main concepts",
+            "keyPoints": [
+                "First key point as a complete sentence",
+                "Second key point as a complete sentence",
+                "Third key point as a complete sentence",
+                "Fourth key point as a complete sentence",
+                "Fifth key point as a complete sentence"
+            ],
+            "flashcards": [
+                {{
+                    "question": "A specific question about a key concept?",
+                    "answer": "A clear and concise answer to the question."
+                }},
+                {{
+                    "question": "Another specific question about the content?",
+                    "answer": "A detailed but focused answer."
+                }},
+                {{
+                    "question": "A third question testing understanding?",
+                    "answer": "A comprehensive answer that demonstrates mastery."
+                }}
+            ]
+        }}
+
+        The response MUST:
+        1. Include a detailed summary that captures the main ideas
+        2. Have exactly 5 key points as complete sentences
+        3. Have exactly 3 flashcards with clear questions and answers
+        4. Be in valid JSON format
+
+        Here is the transcript to analyze:
         {transcript}
-        
-        Format the response as JSON with the following structure:
-        {{
-            "summary": "...",
-            "keyPoints": ["point1", "point2", ...],
-            "flashcards": [
-                {{"question": "...", "answer": "..."}}
-            ]
-        }}
         """
-        
-        log_to_modal("Preparing API request to OpenAI...")
-        log_to_modal(f"Prompt length: {len(summary_prompt)} characters")
-        
-        request_start_time = time.time()
-        log_to_modal("Sending request to OpenAI API...")
-        
-        try:
-            response = client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant that creates educational content from video transcripts."},
-                    {"role": "user", "content": summary_prompt}
-                ],
-                temperature=0.7,
-                max_tokens=2000
-            )
-            request_duration = time.time() - request_start_time
-            
-            log_to_modal(f"OpenAI API response received in {request_duration:.2f} seconds")
-            log_to_modal(f"Response model: {response.model}")
-            log_to_modal(f"Response usage: {response.usage}")
-            log_to_modal(f"First choice finish reason: {response.choices[0].finish_reason}")
-            
-            result = json.loads(response.choices[0].message.content)
-            log_to_modal("Successfully parsed response as JSON")
-            log_to_modal(f"Result keys: {list(result.keys())}")
-            return result
-            
-        except openai.APIError as e:
-            log_to_modal(f"OpenAI API error: {str(e)}", "ERROR")
-            log_to_modal(f"Error type: {type(e).__name__}", "ERROR")
-            raise
-            
-        except json.JSONDecodeError as e:
-            log_to_modal("Failed to parse response as JSON", "ERROR")
-            log_to_modal(f"Raw response content: {response.choices[0].message.content}", "ERROR")
-            raise
-            
-    except Exception as e:
-        error_msg = f"Error in process_transcript: {str(e)}"
-        log_to_modal(error_msg, "ERROR")
-        log_to_modal(f"Full traceback: {traceback.format_exc()}", "ERROR")
-        return {
-            "error": error_msg,
-            "traceback": traceback.format_exc()
-        }
 
-@app.function(
-    secrets=[Secret.from_name("openai-secret")],
-    timeout=1800,
-    image=image
-)
-def test_openai_integration():
-    """Test function to verify OpenAI API integration"""
-    log_to_modal("Starting OpenAI integration test...")
-    
-    test_transcript = """
-    This is a test transcript. In this video, we discuss the basics of machine learning.
-    The key topics covered include supervised learning, unsupervised learning, and reinforcement learning.
-    We also talk about common algorithms like linear regression and neural networks.
-    """
-    
-    try:
-        client = get_openai_client()
-        
-        log_to_modal("Making test API call to OpenAI...")
-        
-        summary_prompt = f"""Please analyze this transcript and provide:
-        1. A concise summary (2-3 paragraphs)
-        2. 3-5 key points
-        3. 5 flashcards in Q&A format
-        
-        Transcript:
-        {test_transcript}
-        
-        Format the response as JSON with the following structure:
-        {{
-            "summary": "...",
-            "keyPoints": ["point1", "point2", ...],
-            "flashcards": [
-                {{"question": "...", "answer": "..."}}
-            ]
-        }}
-        """
-        
-        request_start_time = time.time()
+        log("Sending request to OpenAI...")
         response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "You are a helpful assistant that creates educational content from video transcripts."},
-                {"role": "user", "content": summary_prompt}
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant that creates educational content from video transcripts. You MUST return responses in valid JSON format with the exact structure specified."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
             ],
             temperature=0.7,
-            max_tokens=2000
+            max_tokens=2000,
+            response_format={ "type": "json_object" }
         )
-        request_duration = time.time() - request_start_time
-        
-        log_to_modal(f"OpenAI API response received in {request_duration:.2f} seconds")
-        log_to_modal(f"Response model: {response.model}")
-        log_to_modal(f"Response usage: {response.usage}")
-        log_to_modal(f"First choice finish reason: {response.choices[0].finish_reason}")
-        
-        result = json.loads(response.choices[0].message.content)
-        log_to_modal("Successfully parsed response as JSON")
-        log_to_modal(f"Result keys: {list(result.keys())}")
-        return result
-        
-    except Exception as e:
-        error_msg = f"Test failed: {str(e)}"
-        log_to_modal(error_msg, "ERROR")
-        log_to_modal(f"Full traceback: {traceback.format_exc()}", "ERROR")
-        return {"error": error_msg}
 
-def get_openai_client():
-    """Configure OpenAI client"""
-    log_to_modal("Initializing OpenAI client...")
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        log_to_modal("No API key found in environment!", "ERROR")
-        raise ValueError("OPENAI_API_KEY not found in environment")
-    
-    log_to_modal(f"API Key found (starts with: {api_key[:8]}...)")
-    
-    # Initialize standard OpenAI client
-    client = openai.OpenAI(
-        api_key=api_key
-    )
-    
-    # Test the API key with a simple request
-    try:
-        models = client.models.list()
-        log_to_modal(f"API test successful - available models: {[model.id for model in models.data[:3]]}")
+        # Parse OpenAI response
+        summary_data = json.loads(response.choices[0].message.content)
+        log("Successfully parsed OpenAI response")
+
+        # Combine all results
+        final_result = {
+            "summary": summary_data["summary"],
+            "keyPoints": summary_data["keyPoints"][:5],  # Ensure exactly 5 key points
+            "flashcards": summary_data["flashcards"][:3],  # Ensure exactly 3 flashcards
+            "transcript": transcript,
+            "segments": [
+                {
+                    "start": s["start"],
+                    "end": s["end"],
+                    "text": s["text"]
+                }
+                for s in segments
+            ]
+        }
+
+        # Validate and provide defaults if needed
+        if len(final_result["keyPoints"]) < 5:
+            final_result["keyPoints"].extend(["Additional key point"] * (5 - len(final_result["keyPoints"])))
+
+        if len(final_result["flashcards"]) < 3:
+            default_card = {"question": "Additional question?", "answer": "Additional answer."}
+            final_result["flashcards"].extend([default_card] * (3 - len(final_result["flashcards"])))
+
+        log("Processing completed successfully")
+        return final_result
+
     except Exception as e:
-        log_to_modal(f"API test failed: {str(e)}", "ERROR")
+        log(f"Error in process_video: {str(e)}", "ERROR")
         raise
-    
-    return client
 
 if __name__ == "__main__":
     app.serve() 
