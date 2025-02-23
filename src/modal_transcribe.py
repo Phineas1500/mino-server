@@ -83,16 +83,24 @@ async def process_video(audio_data: bytes, filename: str):
             ],
             "flashcards": [
                 {{
-                    "question": "A specific question about a key concept?",
-                    "answer": "A clear and concise answer to the question."
+                    "question": "Basic concept question about a key term or idea?",
+                    "answer": "A clear and concise answer to the basic concept."
                 }},
                 {{
-                    "question": "Another specific question about the content?",
-                    "answer": "A detailed but focused answer."
+                    "question": "Fundamental question about the content?",
+                    "answer": "A straightforward explanation of the fundamental concept."
                 }},
                 {{
-                    "question": "A third question testing understanding?",
-                    "answer": "A comprehensive answer that demonstrates mastery."
+                    "question": "Question testing basic understanding?",
+                    "answer": "A comprehensive answer demonstrating basic mastery."
+                }},
+                {{
+                    "question": "More challenging question requiring synthesis of multiple concepts?",
+                    "answer": "A detailed answer that connects multiple ideas and demonstrates deeper understanding."
+                }},
+                {{
+                    "question": "Advanced inference question about implications or applications?",
+                    "answer": "A sophisticated answer that extends beyond the explicit content to explore implications or real-world applications."
                 }}
             ]
         }}
@@ -100,7 +108,10 @@ async def process_video(audio_data: bytes, filename: str):
         The response MUST:
         1. Include a detailed summary that captures the main ideas
         2. Have exactly 5 key points as complete sentences
-        3. Have exactly 3 flashcards with clear questions and answers
+        3. Have exactly 5 flashcards with clear questions and answers, where:
+           - First 3 cards test basic understanding of explicit content
+           - Fourth card requires connecting multiple concepts
+           - Fifth card tests ability to make inferences or applications
         4. Be in valid JSON format
 
         Here is the transcript to analyze:
@@ -113,7 +124,7 @@ async def process_video(audio_data: bytes, filename: str):
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a helpful assistant that creates educational content from video transcripts. You MUST return responses in valid JSON format with the exact structure specified."
+                    "content": "You are a helpful assistant that creates educational content from video transcripts. You MUST return responses in valid JSON format with the exact structure specified. For flashcards, create a progression from basic recall to advanced synthesis and application."
                 },
                 {
                     "role": "user",
@@ -121,7 +132,7 @@ async def process_video(audio_data: bytes, filename: str):
                 }
             ],
             temperature=0.7,
-            max_tokens=2000,
+            max_tokens=3000,
             response_format={ "type": "json_object" }
         )
 
@@ -133,7 +144,7 @@ async def process_video(audio_data: bytes, filename: str):
         final_result = {
             "summary": summary_data["summary"],
             "keyPoints": summary_data["keyPoints"][:5],  # Ensure exactly 5 key points
-            "flashcards": summary_data["flashcards"][:3],  # Ensure exactly 3 flashcards
+            "flashcards": summary_data["flashcards"][:5],  # Ensure exactly 5 flashcards
             "transcript": transcript,
             "segments": [
                 {
@@ -149,9 +160,15 @@ async def process_video(audio_data: bytes, filename: str):
         if len(final_result["keyPoints"]) < 5:
             final_result["keyPoints"].extend(["Additional key point"] * (5 - len(final_result["keyPoints"])))
 
-        if len(final_result["flashcards"]) < 3:
-            default_card = {"question": "Additional question?", "answer": "Additional answer."}
-            final_result["flashcards"].extend([default_card] * (3 - len(final_result["flashcards"])))
+        if len(final_result["flashcards"]) < 5:
+            default_cards = [
+                {"question": "Basic concept question?", "answer": "Basic answer."},
+                {"question": "Fundamental question?", "answer": "Fundamental answer."},
+                {"question": "Understanding question?", "answer": "Understanding answer."},
+                {"question": "Synthesis question?", "answer": "Synthesis answer."},
+                {"question": "Application question?", "answer": "Application answer."}
+            ]
+            final_result["flashcards"].extend(default_cards[len(final_result["flashcards"]):])
 
         log("Processing completed successfully")
         return final_result
