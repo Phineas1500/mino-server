@@ -8,7 +8,7 @@ from modal import Function
 
 def process_video(input_path, output_path):
     """
-    Process video and send to Modal for transcription, summarization, and cutting
+    Process video and send to Modal for transcription, content analysis, and segment analysis
     """
     try:
         sys.stderr.write(f"Starting process_video with input: {input_path}\n")
@@ -34,21 +34,21 @@ def process_video(input_path, output_path):
         with open(transcript_path, 'w', encoding='utf-8') as f:
             f.write(result["transcript"])
             
-        # Write shortened video to file if it exists
-        if "shortened_video" in result:
-            shortened_path = input_path.with_stem(f"{input_path.stem}_shortened")
-            with open(shortened_path, 'wb') as f:
-                f.write(result["shortened_video"])
-            sys.stderr.write(f"Saved shortened video to: {shortened_path}\n")
-        
         output = {
             "status": "success",
             "transcript_file": str(transcript_path),
+            "transcript": result["transcript"],
             "summary": result["summary"],
             "keyPoints": result["keyPoints"],
             "flashcards": result["flashcards"],
             "segments": result["segments"],
-            "shortened_video_path": str(shortened_path) if "shortened_video" in result else None
+            "stats": result.get("stats", {
+                "total_segments": 0,
+                "skippable_segments": 0,
+                "total_duration": 0,
+                "skippable_duration": 0,
+                "skippable_percentage": 0
+            })
         }
         
         sys.stderr.write("Processing completed successfully\n")
