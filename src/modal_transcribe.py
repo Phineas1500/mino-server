@@ -9,6 +9,8 @@ from moviepy.editor import VideoFileClip
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import traceback
+import numpy as np
+import soundfile as sf
 
 # Create a Modal app
 app = App("whisper-transcription")
@@ -49,66 +51,226 @@ image = (
     )
 )
 
-def cut_video_segments(video_path, segments, min_segment_duration=1.0, max_pause_duration=0.5):
-    """Cut video based on transcript segments, removing long pauses."""
+def cut_video_segments(video_path, segments, summary_data, min_segment_duration=1.0, max_pause_duration=0.2):
+    """Cut video based on importance scores with smooth transitions and pause removal."""
     try:
         from moviepy.editor import VideoFileClip, concatenate_videoclips
         
-        log(f"Opening video file for cutting: {video_path}")
-        # Explicitly set audio=True to ensure audio is loaded
+        log("Loading video file...")
         video = VideoFileClip(str(video_path), audio=True)
+        video_duration = video.duration
+        log(f"Video duration: {video_duration:.2f}s")
         
-        if not video.fps:
-            raise ValueError("Could not determine video FPS")
+        # First, detect and remove pauses
+        log("Detecting pauses in audio...")
+        temp_audio = str(Path(video_path).with_suffix('.wav'))
+        video.audio.write_audiofile(
+            temp_audio,
+            codec='pcm_s16le',
+            fps=16000,
+            ffmpeg_params=["-ac", "1"],
+            verbose=False,
+            logger=None
+        )
+        
+        # Read audio and detect silent segments
+        audio_data, sample_rate = sf.read(temp_audio)
+        if len(audio_data.shape) > 1:
+            audio_data = np.mean(audio_data, axis=1)
             
+        # Calculate frame energy in dB
+        frame_length = int(0.02 * sample_rate)  # 20ms frames
+        hop_length = frame_length // 2
+        frames = []
+        
+        for i in range(0, len(audio_data) - frame_length, hop_length):
+            frame = audio_data[i:i + frame_length]
+            energy = 20 * np.log10(np.mean(frame ** 2) + 1e-10)
+            frames.append(energy)
+            
+        frames = np.array(frames)
+        threshold_db = -40  # Threshold for silence detection
+        is_silent = frames < threshold_db
+        
+        # Convert frame indices to time
+        time_per_frame = hop_length / sample_rate
+        silent_segments = []
+        start_frame = None
+        
+        # Find continuous silent segments
+        for i in range(len(is_silent)):
+            if is_silent[i] and start_frame is None:
+                start_frame = i
+            elif not is_silent[i] and start_frame is not None:
+                duration = (i - start_frame) * time_per_frame
+                if duration >= max_pause_duration:
+                    start_time = start_frame * time_per_frame
+                    end_time = i * time_per_frame
+                    silent_segments.append((start_time, end_time))
+                start_frame = None
+        
+        # Check final segment
+        if start_frame is not None:
+            duration = (len(is_silent) - start_frame) * time_per_frame
+            if duration >= max_pause_duration:
+                start_time = start_frame * time_per_frame
+                end_time = len(is_silent) * time_per_frame
+                silent_segments.append((start_time, end_time))
+        
+        # Clean up audio file
+        Path(temp_audio).unlink()
+        
+        # Create segments without pauses
+        log(f"Found {len(silent_segments)} pauses to remove")
+        active_segments = []
+        current_time = 0
+        
+        for pause_start, pause_end in silent_segments:
+            if pause_start > current_time:
+                active_segments.append({
+                    "start": current_time,
+                    "end": pause_start
+                })
+            current_time = pause_end
+        
+        # Add final segment if needed
+        if current_time < video_duration:
+            active_segments.append({
+                "start": current_time,
+                "end": video_duration
+            })
+        
+        # Get OpenAI client for importance analysis
+        client = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        
+        # Analyze segments importance
+        log("Analyzing segments importance with GPT-3.5-turbo...")
+        analyzed_segments = analyze_segments_importance(segments, client, summary_data)
+        
+        # Clean up segments
+        analyzed_segments = fix_overlapping_segments(analyzed_segments)
+        analyzed_segments = cleanup_segments(analyzed_segments, min_duration=min_segment_duration)
+        
+        # Ensure segments don't exceed video duration
+        cleaned_segments = []
+        for segment in analyzed_segments:
+            if segment["start"] >= video_duration:
+                continue
+            segment["end"] = min(segment["end"], video_duration)
+            cleaned_segments.append(segment)
+        
+        analyzed_segments = cleaned_segments
+        
+        # Process each active segment with appropriate speed
         clips_to_keep = []
+        total_original_duration = 0
+        total_kept_duration = 0
+        prev_clip = None
         
-        for i, segment in enumerate(segments):
-            segment_duration = segment["end"] - segment["start"]
+        for active_seg in active_segments:
+            # Find analyzed segments that overlap with this active segment
+            relevant_segments = [
+                seg for seg in analyzed_segments
+                if seg["end"] > active_seg["start"] and seg["start"] < active_seg["end"]
+            ]
             
-            if segment_duration < min_segment_duration:
+            if not relevant_segments:
                 continue
                 
-            if i > 0:
-                pause_duration = segment["start"] - segments[i-1]["end"]
-                if pause_duration > max_pause_duration:
-                    segment["start"] = segments[i-1]["end"] + max_pause_duration
+            # Use average importance of overlapping segments
+            avg_importance = sum(float(s["importance_score"]) for s in relevant_segments) / len(relevant_segments)
+            duration = active_seg["end"] - active_seg["start"]
+            total_original_duration += duration
             
-            log(f"Processing segment {i+1}/{len(segments)}: {segment['start']:.2f}s to {segment['end']:.2f}s")
-            clip = video.subclip(segment["start"], segment["end"])
-            clips_to_keep.append(clip)
+            try:
+                clip = video.subclip(active_seg["start"], active_seg["end"])
+                
+                # Apply speed adjustment based on importance
+                if avg_importance >= 0.8:  # Key content
+                    speed_factor = 1.0
+                elif avg_importance >= 0.6:
+                    speed_factor = 1.25
+                elif avg_importance >= 0.4:
+                    speed_factor = 1.75
+                elif avg_importance >= 0.2:
+                    speed_factor = 2.25
+                else:
+                    continue  # Skip very low importance segments
+                
+                try:
+                    clip = clip.speedx(speed_factor)
+                    if clip.audio is not None:
+                        try:
+                            new_fps = clip.audio.fps * speed_factor
+                            clip = clip.set_audio(clip.audio.set_fps(new_fps))
+                        except Exception as audio_e:
+                            log(f"Warning: Could not adjust audio pitch: {str(audio_e)}", "WARNING")
+                    
+                    effective_duration = duration / speed_factor
+                    
+                except Exception as speed_e:
+                    log(f"Warning: Failed to adjust speed, using original clip: {str(speed_e)}", "WARNING")
+                    effective_duration = duration
+                
+                # Add crossfade if not the first clip
+                if prev_clip is not None:
+                    try:
+                        clip = clip.crossfadein(0.3)
+                    except Exception as fade_e:
+                        log(f"Warning: Could not add crossfade: {str(fade_e)}", "WARNING")
+                
+                total_kept_duration += effective_duration
+                clips_to_keep.append(clip)
+                prev_clip = clip
+                
+            except Exception as e:
+                log(f"Error processing segment {active_seg['start']:.2f}s - {active_seg['end']:.2f}s: {str(e)}", "ERROR")
+                continue
+        
+        # Log statistics
+        if total_original_duration > 0:
+            reduction_percent = (1 - total_kept_duration / total_original_duration) * 100
+            log(f"""Video Processing Statistics:
+            Original Duration: {total_original_duration:.2f}s
+            Final Duration: {total_kept_duration:.2f}s
+            Reduction: {reduction_percent:.1f}%""", "INFO")
         
         if not clips_to_keep:
             log("No valid segments found - using original video", "WARNING")
             output_path = str(video_path)
             video.close()
             return output_path
+        
+        # Concatenate clips
+        try:
+            log(f"Concatenating {len(clips_to_keep)} clips...")
+            final_video = concatenate_videoclips(clips_to_keep)
             
-        log(f"Concatenating {len(clips_to_keep)} clips...")
-        final_video = concatenate_videoclips(clips_to_keep)
+            output_path = str(Path(video_path).with_stem(f"{Path(video_path).stem}_shortened"))
+            log(f"Writing shortened video to: {output_path}")
+            
+            final_video.write_videofile(
+                output_path,
+                codec="libx264",
+                audio_codec="aac",
+                verbose=False,
+                logger=None
+            )
+            
+            # Clean up
+            final_video.close()
+            for clip in clips_to_keep:
+                clip.close()
+            
+        except Exception as e:
+            log(f"Error during concatenation: {str(e)}", "ERROR")
+            output_path = str(video_path)
         
-        output_path = str(Path(video_path).with_stem(f"{Path(video_path).stem}_shortened"))
-        log(f"Writing shortened video to: {output_path}")
-        
-        final_video.write_videofile(
-            output_path,
-            codec="libx264",
-            audio_codec="aac",
-            verbose=False,
-            logger=None
-        )
-        
-        # Clean up
         video.close()
-        final_video.close()
-        for clip in clips_to_keep:
-            clip.close()
-            
         return output_path
         
     except Exception as e:
         log(f"Error in cut_video_segments: {str(e)}", "ERROR")
-        # If there's an error, return the original video path
         return str(video_path)
 
 @app.function(
@@ -445,6 +607,14 @@ async def process_video(video_data: bytes, filename: str):
                         importance_score = max(1, min(10, float(rating["importance_score"])))
                         can_skip = importance_score < 4
                         
+                        # Calculate playback speed based on importance score
+                        # Linear scale: 10 -> 1x speed, 1 -> 2.5x speed
+                        playback_speed = 1.0 + (1.5 * (10 - importance_score) / 9)
+                        playback_speed = round(playback_speed, 2)
+                        
+                        # Calculate adjusted duration with speed
+                        adjusted_duration = segment_duration / playback_speed
+                        
                         if can_skip:
                             skippable_duration += segment_duration
                         
@@ -454,6 +624,9 @@ async def process_video(video_data: bytes, filename: str):
                             "text": seg["text"],
                             "can_skip": can_skip,
                             "importance_score": importance_score,
+                            "playback_speed": playback_speed,
+                            "original_duration": segment_duration,
+                            "adjusted_duration": adjusted_duration,
                             "reason": rating["reason"]
                         })
                     
@@ -463,21 +636,30 @@ async def process_video(video_data: bytes, filename: str):
                     log(f"Error analyzing batch starting at segment {i}: {str(e)}", "WARNING")
                     # Handle failed batch with default values
                     for seg in batch:
+                        segment_duration = seg["end"] - seg["start"]
                         analyzed_segments.append({
                             "start": seg["start"],
                             "end": seg["end"],
                             "text": seg["text"],
                             "can_skip": False,
                             "importance_score": 5,
+                            "playback_speed": 1.75,  # Middle speed for default
+                            "original_duration": segment_duration,
+                            "adjusted_duration": segment_duration / 1.75,
                             "reason": "Error in batch analysis"
                         })
-                        total_duration += seg["end"] - seg["start"]
+                        total_duration += segment_duration
 
             # Calculate statistics
             skippable_segments = [s for s in analyzed_segments if s["can_skip"]]
+            total_adjusted_duration = sum(s["adjusted_duration"] for s in analyzed_segments)
+            time_saved = total_duration - total_adjusted_duration
             skippable_percentage = (skippable_duration/total_duration)*100 if total_duration > 0 else 0
+            time_saved_percentage = (time_saved/total_duration)*100 if total_duration > 0 else 0
             
             log(f"Analysis complete: {len(skippable_segments)} skippable segments found")
+            log(f"Original duration: {total_duration:.1f}s, Adjusted duration: {total_adjusted_duration:.1f}s")
+            log(f"Time saved through speed adjustments: {time_saved:.1f}s ({time_saved_percentage:.1f}%)")
             log(f"Potentially skippable content: {skippable_percentage:.1f}% of video")
 
             # Return the final result with both educational content and skippable segments
@@ -533,4 +715,4 @@ async def process_video(video_data: bytes, filename: str):
 
 
 if __name__ == "__main__":
-    app.serve() 
+    app.serve()
