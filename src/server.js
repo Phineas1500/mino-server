@@ -1,13 +1,43 @@
-// server.js
+// Modify the top imports in server.js
+require('dotenv').config();
+
 const express = require('express');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const cors = require('cors');
 const { spawn } = require('child_process');
+const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+const { generatePresignedUrl, s3Client } = require('./services/s3');
+const { promises: fsPromises } = require('fs');
+
+// Add the error handling right after imports
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught Exception:', error);
+});
+
+console.log('AWS Config:', {
+  region: process.env.AWS_REGION,
+  bucket: process.env.AWS_BUCKET_NAME,
+  hasAccessKey: !!process.env.AWS_ACCESS_KEY_ID,
+  hasSecretKey: !!process.env.AWS_SECRET_ACCESS_KEY
+});
 
 const app = express();
 const PORT = 3001;
+
+app.use((req, res, next) => {
+  console.log(`${req.method} ${req.path}`, {
+    body: req.body,
+    query: req.query
+  });
+  next();
+});
 
 app.use(cors({
   origin: true,
@@ -155,6 +185,182 @@ app.post('/upload', upload.single('video'), async (req, res) => {
       success: false, 
       error: error.message 
     });
+  }
+});
+
+app.post('/s3/presigned', async (req, res) => {
+  try {
+    const { fileName, fileType } = req.body;
+    
+    if (!fileName || !fileType) {
+      return res.status(400).json({ 
+        error: 'fileName and fileType are required' 
+      });
+    }
+
+    const presignedData = await generatePresignedUrl(fileName, fileType);
+    res.json(presignedData);
+  } catch (error) {
+    console.error('Error generating presigned URL:', error);
+    res.status(500).json({ 
+      error: 'Failed to generate upload URL' 
+    });
+  }
+});
+
+// Replace your existing /process/s3-video endpoint with this:
+app.post('/process/s3-video', async (req, res) => {
+  let localPath;
+  let result;
+
+  try {
+    const { fileKey } = req.body;
+    
+    if (!fileKey) {
+      return res.status(400).json({ 
+        error: 'fileKey is required' 
+      });
+    }
+
+    console.log('Processing video from S3:', fileKey);
+
+    // Create temp directory if it doesn't exist
+    const tempDir = path.join(__dirname, '..', 'temp');
+    await fsPromises.mkdir(tempDir, { recursive: true });
+
+    // Download file from S3
+    localPath = path.join(tempDir, path.basename(fileKey));
+    
+    const command = new GetObjectCommand({
+      Bucket: process.env.AWS_BUCKET_NAME,
+      Key: fileKey
+    });
+
+    console.log('Fetching from S3:', {
+      bucket: process.env.AWS_BUCKET_NAME,
+      key: fileKey
+    });
+
+    const response = await s3Client.send(command);
+    const readStream = response.Body;
+
+    if (!readStream) {
+      throw new Error('Failed to get video stream from S3');
+    }
+
+    // Write the file locally
+    const writeStream = await fsPromises.open(localPath, 'w');
+    const chunks = [];
+    for await (const chunk of readStream) {
+      chunks.push(chunk);
+    }
+    await writeStream.write(Buffer.concat(chunks));
+    await writeStream.close();
+
+    console.log('Downloaded file from S3 to:', localPath);
+
+    // Process the video using existing video_processor.py
+    const pythonCommand = getPythonCommand();
+    const pythonProcess = spawn(pythonCommand, [
+      path.join(__dirname, 'video_processor.py'),
+      localPath,
+      localPath
+    ]);
+
+    let pythonOutput = '';
+    let pythonError = '';
+
+    pythonProcess.stdout.on('data', (data) => {
+      const output = data.toString();
+      console.log('Python output:', output);
+      pythonOutput += output;
+    });
+
+    pythonProcess.stderr.on('data', (data) => {
+      const error = data.toString();
+      console.log('Python error:', error);
+      pythonError += error;
+    });
+
+    await new Promise((resolve, reject) => {
+      pythonProcess.on('close', async (code) => {
+        try {
+          if (code !== 0) {
+            throw new Error(`Python process failed with code ${code}: ${pythonError}`);
+          }
+
+          // Parse Python output
+          const matches = pythonOutput.match(/\{(?:[^{}]|(\{[^{}]*\}))*\}/g);
+          if (!matches) {
+            throw new Error('No valid JSON found in Python output');
+          }
+
+          result = JSON.parse(matches[matches.length - 1]);
+          
+          if (result.status === 'success') {
+            // Read the transcript file
+            let transcriptContent = '';
+            
+            if (result.transcript_file) {
+              try {
+                transcriptContent = await fsPromises.readFile(result.transcript_file, 'utf8');
+              } catch (err) {
+                console.warn('Could not read transcript file:', err);
+              }
+            }
+            
+            // Generate a signed URL for accessing the processed video
+            const videoCommand = new GetObjectCommand({
+              Bucket: process.env.AWS_BUCKET_NAME,
+              Key: fileKey
+            });
+            
+            const videoUrl = await getSignedUrl(s3Client, videoCommand, {
+              expiresIn: 3600 // URL expires in 1 hour
+            });
+
+            console.log('Generated signed URL for video:', videoUrl);
+
+            res.json({
+              success: true,
+              url: videoUrl,
+              data: {
+                transcript: transcriptContent,
+                segments: result.segments || []
+              }
+            });
+            resolve();
+          } else {
+            throw new Error(result.error || 'Processing failed');
+          }
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+  } catch (error) {
+    console.error('Error processing video:', error);
+    res.status(500).json({ 
+      error: 'Failed to process video',
+      details: error.message 
+    });
+  } finally {
+    // Clean up temporary files
+    try {
+      if (localPath) {
+        await fsPromises.unlink(localPath).catch(err => 
+          console.error('Error removing video temp file:', err)
+        );
+      }
+      
+      if (result?.transcript_file) {
+        await fsPromises.unlink(result.transcript_file).catch(err => 
+          console.error('Error removing transcript temp file:', err)
+        );
+      }
+    } catch (err) {
+      console.error('Error in cleanup:', err);
+    }
   }
 });
 

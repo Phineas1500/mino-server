@@ -9,4 +9,5 @@ lib64
 logs
 pyvenv.cfg
 src/uploadsbazinga
-src/__pycache__myenv1/
+src/__pycache__
+temp

@@ -8,6 +8,10 @@ module.exports = {
       'uploads/*',
       'src/uploads',
       'src/uploads/*',
+      'temp',
+      'temp/*',
+      'src/temp',
+      'src/temp/*',
       'logs/*',
       'node_modules'
     ],
