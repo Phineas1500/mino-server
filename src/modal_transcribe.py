@@ -11,6 +11,326 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import traceback
 import numpy as np
 import soundfile as sf
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import time
+
+def fix_overlapping_segments(segments):
+    """Fix any overlapping segments by adjusting end times"""
+    if not segments:
+        return []
+        
+    # Sort segments by start time
+    sorted_segments = sorted(segments, key=lambda x: x["start"])
+    
+    # Fix overlaps
+    fixed_segments = [sorted_segments[0]]
+    for current in sorted_segments[1:]:
+        previous = fixed_segments[-1]
+        
+        # Check for overlap
+        if current["start"] < previous["end"]:
+            # Adjust the previous segment's end time
+            overlap = previous["end"] - current["start"]
+            previous["end"] = current["start"]
+            
+            # Adjust original and adjusted durations if they exist
+            if "original_duration" in previous:
+                previous["original_duration"] -= overlap
+            if "adjusted_duration" in previous:
+                # Scale down adjusted duration proportionally
+                if previous["original_duration"] > 0:
+                    ratio = previous["adjusted_duration"] / (previous["original_duration"] + overlap)
+                    previous["adjusted_duration"] = previous["original_duration"] * ratio
+        
+        fixed_segments.append(current)
+    
+    return fixed_segments
+
+def cleanup_segments(segments, min_duration=0.5):
+    """Remove segments that are too short and ensure all values are valid"""
+    if not segments:
+        return []
+        
+    cleaned = []
+    for segment in segments:
+        # Skip segments that are too short
+        if segment["end"] - segment["start"] < min_duration:
+            continue
+            
+        # Ensure all required fields exist and have valid values
+        cleaned_segment = {
+            "start": float(segment["start"]),
+            "end": float(segment["end"]),
+            "text": str(segment.get("text", "")),
+            "importance_score": float(segment.get("importance_score", 5)),
+        }
+        
+        # Add optional fields if they exist
+        if "can_skip" in segment:
+            cleaned_segment["can_skip"] = bool(segment["can_skip"])
+        if "playback_speed" in segment:
+            cleaned_segment["playback_speed"] = max(1.0, min(2.5, float(segment.get("playback_speed", 1.5))))
+        if "reason" in segment:
+            cleaned_segment["reason"] = str(segment["reason"])
+        if "original_duration" in segment:
+            cleaned_segment["original_duration"] = float(segment["original_duration"])
+        if "adjusted_duration" in segment:
+            cleaned_segment["adjusted_duration"] = float(segment["adjusted_duration"])
+        if "speed" in segment:
+            cleaned_segment["speed"] = float(segment["speed"])
+            
+        cleaned.append(cleaned_segment)
+    
+    return cleaned
+
+def analyze_segments_importance(segments, client, summary_data=None):
+    """Legacy function signature for compatibility - delegates to the new parallel method"""
+    log("Using parallel processing for segment importance analysis")
+    loop = asyncio.get_event_loop()
+    analyzed_segments, _ = loop.run_until_complete(process_segments_parallel(segments, client))
+    return analyzed_segments
+
+async def process_batch_async(client, batch, batch_idx, total_batches):
+    """Process a batch of segments asynchronously with OpenAI API"""
+    try:
+        batch_texts = [seg["text"] for seg in batch]
+        log(f"Starting batch {batch_idx+1}/{total_batches} with {len(batch)} segments")
+        
+        # Build prompt for this batch
+        segments_text = "\n\n".join([f"Segment {j+1}: \"{text}\"" for j, text in enumerate(batch_texts)])
+        
+        importance_prompt = f"""Rate each lecture segment's importance on a scale of 1-10, determine if it can be skipped, and suggest an optimal playback speed. Be concise in your explanations.
+
+        Guidelines:
+        10 = Crucial concept, key definition, or fundamental principle
+        7-9 = Important examples, core ideas, or detailed explanations
+        4-6 = Supporting information, context, or basic examples
+        1-3 = Repetitive information, tangents, or very basic content
+
+        For each segment, a playback speed between 1.0 (for most important) and 2.5 (for least important) should be suggested.
+        A segment can be marked skippable if it has an importance score below 4.
+
+        Segments to analyze:
+        {json.dumps(batch_texts)}
+
+        Respond in JSON format with an array of ratings:
+        {{
+            "ratings": [
+                {{
+                    "importance_score": <number 1-10>,
+                    "can_skip": <true/false>,
+                    "playback_speed": <number between 1.0 and 2.5>,
+                    "reason": "Brief explanation (max 10 words)"
+                }},
+                ...
+            ]
+        }}"""
+
+        # The OpenAI API is not async, so we need to run it in a thread pool
+        def execute_openai_call():
+            return client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You analyze educational content importance efficiently and return valid JSON. Focus on being accurate and consistent in your ratings across the batch."
+                    },
+                    {
+                        "role": "user",
+                        "content": importance_prompt
+                    }
+                ],
+                temperature=0.3,
+                max_tokens=1500,
+                response_format={"type": "json_object"}
+            )
+        
+        # Create a thread pool executor for this batch
+        with ThreadPoolExecutor() as executor:
+            response = await asyncio.get_event_loop().run_in_executor(
+                executor, execute_openai_call
+            )
+        
+        # Process the response
+        analysis = json.loads(response.choices[0].message.content)
+        
+        # Validate response structure and create processed segments
+        processed_segments = []
+        
+        if "ratings" not in analysis or len(analysis["ratings"]) != len(batch):
+            log(f"Batch {batch_idx+1}: Expected {len(batch)} ratings but got {len(analysis.get('ratings', []))}", "WARNING")
+            
+            # Handle mismatched ratings count
+            if "ratings" not in analysis or not analysis["ratings"]:
+                # Create default ratings for the whole batch
+                analysis["ratings"] = [
+                    {
+                        "importance_score": 5,
+                        "can_skip": False,
+                        "playback_speed": 1.75,
+                        "reason": "Default rating (response error)"
+                    } for _ in range(len(batch))
+                ]
+            elif len(analysis["ratings"]) < len(batch):
+                # Append default ratings for missing entries
+                analysis["ratings"].extend([
+                    {
+                        "importance_score": 5,
+                        "can_skip": False,
+                        "playback_speed": 1.75,
+                        "reason": "Default rating (missing in response)"
+                    } for _ in range(len(batch) - len(analysis["ratings"]))
+                ])
+            else:
+                # Truncate extra ratings
+                analysis["ratings"] = analysis["ratings"][:len(batch)]
+        
+        # Process each segment with its rating
+        batch_duration = 0
+        batch_skippable = 0
+        
+        for seg, rating in zip(batch, analysis["ratings"]):
+            segment_duration = seg["end"] - seg["start"]
+            batch_duration += segment_duration
+            
+            # Validate and normalize values
+            try:
+                importance_score = float(rating.get("importance_score", 5))
+                importance_score = max(1, min(10, importance_score))
+                
+                can_skip = bool(rating.get("can_skip", importance_score < 4))
+                
+                playback_speed = float(rating.get("playback_speed", 1.75))
+                playback_speed = max(1.0, min(2.5, playback_speed))
+                
+                reason = str(rating.get("reason", ""))
+            except (ValueError, TypeError) as e:
+                log(f"Error parsing rating values in batch {batch_idx+1}: {str(e)}", "WARNING")
+                importance_score = 5
+                can_skip = False
+                playback_speed = 1.75
+                reason = "Error parsing rating"
+            
+            # Calculate adjusted duration with speed
+            adjusted_duration = segment_duration / playback_speed
+            
+            if can_skip:
+                batch_skippable += segment_duration
+            
+            processed_segments.append({
+                "start": seg["start"],
+                "end": seg["end"],
+                "text": seg["text"],
+                "can_skip": can_skip,
+                "importance_score": importance_score,
+                "playback_speed": playback_speed,
+                "original_duration": segment_duration,
+                "adjusted_duration": adjusted_duration,
+                "reason": reason
+            })
+        
+        log(f"Completed batch {batch_idx+1}/{total_batches}")
+        
+        # Return both the processed segments and the stats
+        return {
+            "segments": processed_segments,
+            "total_duration": batch_duration,
+            "skippable_duration": batch_skippable
+        }
+        
+    except Exception as e:
+        log(f"Error processing batch {batch_idx+1}: {str(e)}", "ERROR")
+        log(f"Stack trace: {traceback.format_exc()}", "WARNING")
+        
+        # Return default values for the entire batch
+        default_segments = []
+        batch_duration = 0
+        
+        for seg in batch:
+            segment_duration = seg["end"] - seg["start"]
+            batch_duration += segment_duration
+            
+            default_segments.append({
+                "start": seg["start"],
+                "end": seg["end"],
+                "text": seg["text"],
+                "can_skip": False,
+                "importance_score": 5,
+                "playback_speed": 1.75,
+                "original_duration": segment_duration,
+                "adjusted_duration": segment_duration / 1.75,
+                "reason": f"Batch processing error: {str(e)[:50]}"
+            })
+        
+        return {
+            "segments": default_segments,
+            "total_duration": batch_duration,
+            "skippable_duration": 0
+        }
+
+async def process_segments_parallel(segments, client, batch_size=20, max_concurrent=5):
+    """Process segments in parallel batches with controlled concurrency"""
+    log(f"Starting parallel processing of {len(segments)} segments with batch size {batch_size} and max concurrency {max_concurrent}")
+    
+    # Split segments into batches
+    batches = []
+    for i in range(0, len(segments), batch_size):
+        batches.append(segments[i:i+batch_size])
+    
+    total_batches = len(batches)
+    
+    # Create a semaphore to limit concurrency
+    semaphore = asyncio.Semaphore(max_concurrent)
+    
+    async def process_with_semaphore(batch, idx):
+        async with semaphore:
+            # Add a small delay between API calls to avoid rate limiting
+            if idx > 0:
+                await asyncio.sleep(0.5)  # 500ms between API calls
+            return await process_batch_async(client, batch, idx, total_batches)
+    
+    # Create tasks for each batch
+    tasks = [process_with_semaphore(batch, i) for i, batch in enumerate(batches)]
+    
+    # Execute all tasks and gather results
+    batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # Process results
+    all_segments = []
+    total_duration = 0
+    skippable_duration = 0
+    
+    for result in batch_results:
+        if isinstance(result, Exception):
+            log(f"A batch failed completely: {str(result)}", "ERROR")
+            continue
+            
+        all_segments.extend(result["segments"])
+        total_duration += result["total_duration"]
+        skippable_duration += result["skippable_duration"]
+    
+    # Calculate adjusted duration
+    total_adjusted_duration = sum(seg["adjusted_duration"] for seg in all_segments)
+    
+    # Calculate statistics
+    skippable_segments = [s for s in all_segments if s["can_skip"]]
+    time_saved = total_duration - total_adjusted_duration
+    skippable_percentage = (skippable_duration/total_duration)*100 if total_duration > 0 else 0
+    time_saved_percentage = (time_saved/total_duration)*100 if total_duration > 0 else 0
+    
+    log(f"Parallel processing complete: {len(skippable_segments)} skippable segments found")
+    log(f"Original duration: {total_duration:.1f}s, Adjusted duration: {total_adjusted_duration:.1f}s")
+    log(f"Time saved through speed adjustments: {time_saved:.1f}s ({time_saved_percentage:.1f}%)")
+    
+    return all_segments, {
+        "total_segments": len(all_segments),
+        "skippable_segments": len(skippable_segments),
+        "total_duration": total_duration,
+        "skippable_duration": skippable_duration,
+        "skippable_percentage": skippable_percentage,
+        "time_saved_percentage": time_saved_percentage
+    }
 
 # Create a Modal app
 app = App("whisper-transcription")
@@ -280,22 +600,23 @@ def cut_video_segments(video_path, segments, summary_data, min_segment_duration=
     secrets=[Secret.from_name("openai-secret")]
 )
 async def optimize_playback_speed(segments):
-    """Analyze transcript segments and determine optimal playback speeds"""
+    """Analyze transcript segments in parallel and determine optimal playback speeds"""
     try:
-        log("Starting playback speed optimization...")
+        log("Starting playback speed optimization with parallel batch processing...")
         
         # Initialize OpenAI client
         client = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-
-        optimized_segments = []
-        total_duration = sum(seg["end"] - seg["start"] for seg in segments)
-        optimized_duration = 0
-
-        for i, segment in enumerate(segments):
+        
+        # Define a specialized version of process_batch_async for this function
+        async def process_speed_batch(batch, idx, total):
             try:
-                log(f"Processing segment {i+1}/{len(segments)}")
+                batch_texts = []
+                for j, segment in enumerate(batch):
+                    batch_texts.append(f"Segment {j+1}: \"{segment['text']}\"")
                 
-                prompt = f"""Rate the educational importance of this lecture segment on a scale of 1-10 and explain why.
+                segments_text = "\n\n".join(batch_texts)
+                
+                prompt = f"""Rate the educational importance of each lecture segment on a scale of 1-10.
 
                 Guidelines:
                 10 = Crucial concept, key definition, or fundamental principle
@@ -303,78 +624,178 @@ async def optimize_playback_speed(segments):
                 4-6 = Supporting information, context, or basic examples
                 1-3 = Repetition, tangents, or very basic content
 
-                Segment: "{segment['text']}"
+                Segments to analyze:
+                {segments_text}
 
-                Respond in this exact JSON format:
+                Respond in this exact JSON format with ratings for each segment:
                 {{
-                    "importance_score": <number 1-10>,
-                    "reason": "<brief explanation of the rating>"
+                    "ratings": [
+                        {{
+                            "importance_score": <number 1-10>,
+                            "reason": "<brief explanation of the rating>"
+                        }},
+                        ... (one for each segment)
+                    ]
                 }}"""
-
-                # Get OpenAI's analysis
-                response = client.chat.completions.create(
-                    model="gpt-3.5-turbo",
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": "You are an expert in educational content analysis. Analyze lecture segments and rate their importance. Always respond in valid JSON format."
-                        },
-                        {
-                            "role": "user",
-                            "content": prompt
-                        }
-                    ],
-                    temperature=0.3,
-                    max_tokens=150,
-                    response_format={ "type": "json_object" }
-                )
-
+                
+                # Run OpenAI call in a thread pool
+                def execute_openai_call():
+                    return client.chat.completions.create(
+                        model="gpt-3.5-turbo",
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": "You are an expert in educational content analysis. Analyze lecture segments and rate their importance. Always respond in valid JSON format."
+                            },
+                            {
+                                "role": "user",
+                                "content": prompt
+                            }
+                        ],
+                        temperature=0.3,
+                        max_tokens=1500,
+                        response_format={"type": "json_object"}
+                    )
+                
+                with ThreadPoolExecutor() as executor:
+                    response = await asyncio.get_event_loop().run_in_executor(
+                        executor, execute_openai_call
+                    )
+                
                 # Parse response
-                analysis = json.loads(response.choices[0].message.content)
+                analysis_result = json.loads(response.choices[0].message.content)
                 
-                # Validate and normalize importance score
-                importance_score = float(analysis["importance_score"])
-                importance_score = max(1, min(10, importance_score))  # Ensure between 1 and 10
+                # Validate response
+                if "ratings" not in analysis_result or not isinstance(analysis_result["ratings"], list):
+                    raise ValueError("Invalid response format: missing 'ratings' array")
                 
-                # Calculate playback speed based on importance score
-                # Formula: speed ranges from 1.0 (score 10) to 2.0 (score 1)
-                speed = 1.0 + ((10 - importance_score) / 9)  # Linear scaling
-                speed = round(min(max(speed, 1.0), 2.0), 2)  # Ensure between 1.0 and 2.0
+                if len(analysis_result["ratings"]) != len(batch):
+                    log(f"Warning: Got {len(analysis_result['ratings'])} ratings for {len(batch)} segments in batch {idx+1}", "WARNING")
+                    
+                    # Adjust ratings array size if needed
+                    if len(analysis_result["ratings"]) < len(batch):
+                        analysis_result["ratings"].extend([
+                            {
+                                "importance_score": 5,
+                                "reason": "Default rating (missing in API response)"
+                            } for _ in range(len(batch) - len(analysis_result["ratings"]))
+                        ])
+                    else:
+                        analysis_result["ratings"] = analysis_result["ratings"][:len(batch)]
                 
-                # Calculate optimized duration for this segment
-                segment_duration = segment["end"] - segment["start"]
-                optimized_duration += segment_duration / speed
+                # Process each segment with its corresponding rating
+                optimized_batch = []
+                batch_duration = 0
+                batch_optimized_duration = 0
                 
-                # Add optimized segment
-                optimized_segments.append({
-                    "start": segment["start"],
-                    "end": segment["end"],
-                    "text": segment["text"],
-                    "speed": speed,
-                    "importance_score": importance_score,
-                    "reason": analysis["reason"]
-                })
+                for segment, rating in zip(batch, analysis_result["ratings"]):
+                    segment_duration = segment["end"] - segment["start"]
+                    batch_duration += segment_duration
+                    
+                    # Validate importance score
+                    importance_score = float(rating.get("importance_score", 5))
+                    importance_score = max(1, min(10, importance_score))
+                    
+                    # Calculate playback speed
+                    speed = 1.0 + ((10 - importance_score) / 9)  # Linear scaling
+                    speed = round(min(max(speed, 1.0), 2.0), 2)
+                    
+                    # Calculate optimized duration
+                    optimized_duration = segment_duration / speed
+                    batch_optimized_duration += optimized_duration
+                    
+                    # Add optimized segment
+                    optimized_batch.append({
+                        "start": segment["start"],
+                        "end": segment["end"],
+                        "text": segment["text"],
+                        "speed": speed,
+                        "importance_score": importance_score,
+                        "reason": rating.get("reason", "")
+                    })
                 
-                log(f"Processed segment {i+1}: Score={importance_score}, Speed={speed:.2f}x")
+                log(f"Successfully processed batch {idx+1}/{total}")
+                
+                return {
+                    "segments": optimized_batch,
+                    "original_duration": batch_duration,
+                    "optimized_duration": batch_optimized_duration
+                }
                 
             except Exception as e:
-                log(f"Error processing segment {i+1}: {str(e)}", "WARNING")
-                # Use conservative defaults for this segment
-                optimized_segments.append({
-                    "start": segment["start"],
-                    "end": segment["end"],
-                    "text": segment["text"],
-                    "speed": 1.0,
-                    "importance_score": 5,
-                    "reason": "Processing error, using default speed"
-                })
-                optimized_duration += segment["end"] - segment["start"]
-
+                log(f"Error processing batch {idx+1}: {str(e)}", "WARNING")
+                
+                # Return default values
+                default_segments = []
+                batch_duration = 0
+                
+                for segment in batch:
+                    segment_duration = segment["end"] - segment["start"]
+                    batch_duration += segment_duration
+                    
+                    default_segments.append({
+                        "start": segment["start"],
+                        "end": segment["end"],
+                        "text": segment["text"],
+                        "speed": 1.0,
+                        "importance_score": 5,
+                        "reason": f"Batch processing error: {str(e)[:50]}"
+                    })
+                
+                return {
+                    "segments": default_segments,
+                    "original_duration": batch_duration,
+                    "optimized_duration": batch_duration  # No optimization applied
+                }
+        
+        # Split segments into batches
+        BATCH_SIZE = 20
+        MAX_CONCURRENT = 5  # Maximum number of concurrent API calls
+        
+        batches = []
+        for i in range(0, len(segments), BATCH_SIZE):
+            batches.append(segments[i:i+BATCH_SIZE])
+        
+        total_batches = len(batches)
+        log(f"Processing {len(segments)} segments in {total_batches} batches with {MAX_CONCURRENT} concurrent requests")
+        
+        # Create a semaphore to limit concurrency
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+        
+        async def process_with_semaphore(batch, idx):
+            async with semaphore:
+                # Add a small delay to prevent rate limiting
+                if idx > 0:
+                    await asyncio.sleep(0.5)
+                return await process_speed_batch(batch, idx, total_batches)
+        
+        # Create tasks for all batches
+        tasks = [process_with_semaphore(batch, i) for i, batch in enumerate(batches)]
+        
+        # Execute all tasks and gather results
+        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Process results
+        optimized_segments = []
+        total_duration = 0
+        optimized_duration = 0
+        
+        for result in batch_results:
+            if isinstance(result, Exception):
+                log(f"A batch failed completely: {str(result)}", "ERROR")
+                continue
+                
+            optimized_segments.extend(result["segments"])
+            total_duration += result["original_duration"]
+            optimized_duration += result["optimized_duration"]
+        
         # Calculate statistics
         time_saved = total_duration - optimized_duration
         time_saved_percentage = (time_saved / total_duration) * 100 if total_duration > 0 else 0
         
-        log(f"Optimization complete. Time saved: {time_saved:.2f} seconds ({time_saved_percentage:.1f}%)")
+        log(f"Optimization complete: Processed {len(optimized_segments)} segments")
+        log(f"Original duration: {total_duration:.2f}s, Optimized duration: {optimized_duration:.2f}s")
+        log(f"Time saved: {time_saved:.2f}s ({time_saved_percentage:.1f}%)")
         
         return {
             "segments": optimized_segments,
@@ -385,9 +806,11 @@ async def optimize_playback_speed(segments):
                 "time_saved_percentage": time_saved_percentage
             }
         }
-
+        
     except Exception as e:
         log(f"Error in optimize_playback_speed: {str(e)}", "ERROR")
+        log(f"Stack trace: {traceback.format_exc()}", "ERROR")
+        
         # Return unoptimized segments if optimization fails
         return {
             "segments": [{
@@ -546,123 +969,16 @@ async def process_video(video_data: bytes, filename: str):
             content_data = json.loads(content_response.choices[0].message.content)
             log("Successfully generated educational content")
 
-            # Process segments in batches for faster analysis
-            log("Analyzing segments for importance ratings...")
-            analyzed_segments = []
-            total_duration = 0
-            skippable_duration = 0
-            
-            # Process segments in batches of 5
-            batch_size = 5
-            for i in range(0, len(segments), batch_size):
-                batch = segments[i:i + batch_size]
-                batch_texts = [seg["text"] for seg in batch]
-                
-                try:
-                    importance_prompt = f"""Rate each lecture segment's importance in context of the entire lecture on a scale of 1-10 and explain why. Be extra lenient with the rating.
+            # Process segments using parallel processing
+            log("Analyzing segments using parallel processing...")
+            analyzed_segments, stats = await process_segments_parallel(
+                segments, 
+                client,
+                batch_size=20,      # Number of segments per batch
+                max_concurrent=5    # Maximum number of concurrent API calls
+            )
 
-                    Guidelines:
-                    10 = Crucial concept, key definition, or fundamental principle
-                    7-9 = Important examples, core ideas, or detailed explanations
-                    4-6 = Supporting information, context, or basic examples
-                    1-3 = Repetitive information, tangents, or very basic content
-
-                    Segments to analyze:
-                    {json.dumps(batch_texts)}
-
-                    Respond in JSON format with an array of ratings:
-                    {{
-                        "ratings": [
-                            {{
-                                "importance_score": <number 1-10>,
-                                "reason": "Brief explanation"
-                            }},
-                            ...
-                        ]
-                    }}"""
-
-                    importance_response = client.chat.completions.create(
-                        model="gpt-3.5-turbo",
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": "You are an expert at analyzing educational content importance. Rate content based on its educational value and relevance."
-                            },
-                            {
-                                "role": "user",
-                                "content": importance_prompt
-                            }
-                        ],
-                        temperature=0.3,
-                        max_tokens=500,
-                        response_format={ "type": "json_object" }
-                    )
-
-                    analysis = json.loads(importance_response.choices[0].message.content)
-                    
-                    for seg, rating in zip(batch, analysis["ratings"]):
-                        segment_duration = seg["end"] - seg["start"]
-                        total_duration += segment_duration
-                        
-                        importance_score = max(1, min(10, float(rating["importance_score"])))
-                        can_skip = importance_score < 4
-                        
-                        # Calculate playback speed based on importance score
-                        # Linear scale: 10 -> 1x speed, 1 -> 2.5x speed
-                        playback_speed = 1.0 + (1.5 * (10 - importance_score) / 9)
-                        playback_speed = round(playback_speed, 2)
-                        
-                        # Calculate adjusted duration with speed
-                        adjusted_duration = segment_duration / playback_speed
-                        
-                        if can_skip:
-                            skippable_duration += segment_duration
-                        
-                        analyzed_segments.append({
-                            "start": seg["start"],
-                            "end": seg["end"],
-                            "text": seg["text"],
-                            "can_skip": can_skip,
-                            "importance_score": importance_score,
-                            "playback_speed": playback_speed,
-                            "original_duration": segment_duration,
-                            "adjusted_duration": adjusted_duration,
-                            "reason": rating["reason"]
-                        })
-                    
-                    log(f"Processed batch {i//batch_size + 1}/{(len(segments) + batch_size - 1)//batch_size}")
-
-                except Exception as e:
-                    log(f"Error analyzing batch starting at segment {i}: {str(e)}", "WARNING")
-                    # Handle failed batch with default values
-                    for seg in batch:
-                        segment_duration = seg["end"] - seg["start"]
-                        analyzed_segments.append({
-                            "start": seg["start"],
-                            "end": seg["end"],
-                            "text": seg["text"],
-                            "can_skip": False,
-                            "importance_score": 5,
-                            "playback_speed": 1.75,  # Middle speed for default
-                            "original_duration": segment_duration,
-                            "adjusted_duration": segment_duration / 1.75,
-                            "reason": "Error in batch analysis"
-                        })
-                        total_duration += segment_duration
-
-            # Calculate statistics
-            skippable_segments = [s for s in analyzed_segments if s["can_skip"]]
-            total_adjusted_duration = sum(s["adjusted_duration"] for s in analyzed_segments)
-            time_saved = total_duration - total_adjusted_duration
-            skippable_percentage = (skippable_duration/total_duration)*100 if total_duration > 0 else 0
-            time_saved_percentage = (time_saved/total_duration)*100 if total_duration > 0 else 0
-            
-            log(f"Analysis complete: {len(skippable_segments)} skippable segments found")
-            log(f"Original duration: {total_duration:.1f}s, Adjusted duration: {total_adjusted_duration:.1f}s")
-            log(f"Time saved through speed adjustments: {time_saved:.1f}s ({time_saved_percentage:.1f}%)")
-            log(f"Potentially skippable content: {skippable_percentage:.1f}% of video")
-
-            # Return the final result with both educational content and skippable segments
+            # Return the final result with educational content and analyzed segments
             return {
                 "status": "success",
                 "summary": content_data["summary"],
@@ -670,13 +986,7 @@ async def process_video(video_data: bytes, filename: str):
                 "flashcards": content_data["flashcards"][:5],
                 "transcript": transcript,
                 "segments": analyzed_segments,
-                "stats": {
-                    "total_segments": len(segments),
-                    "skippable_segments": len(skippable_segments),
-                    "total_duration": total_duration,
-                    "skippable_duration": skippable_duration,
-                    "skippable_percentage": skippable_percentage
-                }
+                "stats": stats
             }
 
         except Exception as e:
@@ -712,7 +1022,6 @@ async def process_video(video_data: bytes, filename: str):
                     log(f"Cleaned up temporary file: {temp_file}")
             except Exception as e:
                 log(f"Error cleaning up {temp_file}: {str(e)}", "WARNING")
-
 
 if __name__ == "__main__":
     app.serve()
