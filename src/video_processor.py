@@ -13,27 +13,57 @@ def compress_video(input_path):
     try:
         video = mp.VideoFileClip(str(input_path))
         
-        # Calculate target size (compress to 720p if larger)
-        target_width = min(1280, video.size[0])
-        target_height = min(720, video.size[1])
+        # More aggressive resizing - target 480p for faster processing
+        target_width = min(854, video.size[0])  # 480p equivalent width
+        target_height = min(480, video.size[1])
         
+        # Only resize if the video is larger than target
         if target_width < video.size[0] or target_height < video.size[1]:
+            # Calculate aspect ratio
+            aspect = video.size[0] / video.size[1]
+            if aspect > (16/9):
+                # Wide video, fit to width
+                target_width = 854
+                target_height = int(854 / aspect)
+            else:
+                # Tall video, fit to height
+                target_height = 480
+                target_width = int(480 * aspect)
             video = video.resize(width=target_width, height=target_height)
+        
+        # Reduce framerate if it's higher than 24fps
+        if video.fps > 24:
+            video = video.set_fps(24)
         
         # Create temporary file for compressed video
         with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as temp_file:
             temp_path = temp_file.name
         
-        # Compress with lower bitrate and h264 codec
+        # Compress with more aggressive settings
         video.write_videofile(
             temp_path,
             codec='libx264',
             audio_codec='aac',
-            preset='faster',  # Faster encoding, slightly larger file
-            bitrate='2000k'  # Adjust bitrate based on your needs
+            preset='ultrafast',  # Fastest encoding preset
+            bitrate='1000k',    # Lower bitrate
+            audio_bitrate='96k', # Lower audio quality
+            threads=4,          # Use multiple threads
+            ffmpeg_params=[
+                '-tune', 'fastdecode',  # Optimize for decoding speed
+                '-maxrate', '1500k',    # Maximum bitrate
+                '-bufsize', '2000k',    # Buffer size
+                '-crf', '28',           # Constant Rate Factor (higher = lower quality, 28 is still acceptable)
+                '-level', '3.0'         # H.264 level (helps with compatibility)
+            ]
         )
         
         video.close()
+        
+        # Verify the compressed file size
+        original_size = os.path.getsize(input_path)
+        compressed_size = os.path.getsize(temp_path)
+        sys.stderr.write(f"Original size: {original_size/1024/1024:.2f}MB, Compressed: {compressed_size/1024/1024:.2f}MB\n")
+        
         return temp_path
     except Exception as e:
         sys.stderr.write(f"Error in compress_video: {str(e)}\n")
@@ -47,22 +77,28 @@ def process_video(input_path, output_path):
         sys.stderr.write(f"Starting process_video with input: {input_path}\n")
         input_path = Path(input_path)
         
-        # Compress video in a separate thread
-        with ThreadPoolExecutor() as executor:
+        # Use ThreadPoolExecutor for parallel processing
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            # Start video compression
             compressed_path_future = executor.submit(compress_video, input_path)
             
-            # While video is compressing, set up Modal connection
-            sys.stderr.write("Connecting to Modal service...\n")
-            modal_fn = Function.lookup("whisper-transcription", "process_video")
+            # While video is compressing, prepare Modal connection
+            modal_setup_future = executor.submit(Function.lookup, "whisper-transcription", "process_video")
             
-            # Wait for compression to complete
+            # Wait for both tasks to complete
             compressed_path = compressed_path_future.result()
+            modal_fn = modal_setup_future.result()
+            
             sys.stderr.write(f"Video compressed: {compressed_path}\n")
         
-        # Read the compressed video file
+        # Read the compressed video file in chunks for memory efficiency
         sys.stderr.write("Reading compressed video file...\n")
+        chunk_size = 1024 * 1024  # 1MB chunks
+        video_chunks = []
         with open(compressed_path, 'rb') as video_file:
-            video_data = video_file.read()
+            while chunk := video_file.read(chunk_size):
+                video_chunks.append(chunk)
+        video_data = b''.join(video_chunks)
         sys.stderr.write(f"Read {len(video_data)} bytes of compressed video data\n")
         
         # Clean up temporary compressed file if it's different from input
