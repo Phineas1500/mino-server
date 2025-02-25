@@ -73,6 +73,8 @@ def process_video(input_path, output_path):
     """
     Process video and send to Modal for transcription, content analysis, and segment analysis
     """
+    temp_files = []  # Keep track of temporary files
+
     try:
         sys.stderr.write(f"Starting process_video with input: {input_path}\n")
         input_path = Path(input_path)
@@ -81,16 +83,19 @@ def process_video(input_path, output_path):
         with ThreadPoolExecutor(max_workers=4) as executor:
             # Start video compression
             compressed_path_future = executor.submit(compress_video, input_path)
+            temp_files.append(compressed_path_future)  # Track for cleanup
             
             # While video is compressing, prepare Modal connection
             modal_setup_future = executor.submit(Function.lookup, "whisper-transcription", "process_video")
             
             # Wait for both tasks to complete
             compressed_path = compressed_path_future.result()
+            if compressed_path != str(input_path):
+                temp_files.append(Path(compressed_path))
             modal_fn = modal_setup_future.result()
             
             sys.stderr.write(f"Video compressed: {compressed_path}\n")
-        
+
         # Read the compressed video file in chunks for memory efficiency
         sys.stderr.write("Reading compressed video file...\n")
         chunk_size = 1024 * 1024  # 1MB chunks
@@ -151,6 +156,15 @@ def process_video(input_path, output_path):
         print(json.dumps(error_output, ensure_ascii=False))
         sys.stdout.flush()
         raise
+    finally:
+        # Clean up all temporary files
+        for temp_file in temp_files:
+            try:
+                if isinstance(temp_file, Path) and temp_file.exists():
+                    temp_file.unlink()
+                    sys.stderr.write(f"Cleaned up temporary file: {temp_file}\n")
+            except Exception as e:
+                sys.stderr.write(f"Error cleaning up {temp_file}: {str(e)}\n")
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:

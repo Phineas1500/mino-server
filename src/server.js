@@ -214,10 +214,32 @@ app.post('/s3/presigned', async (req, res) => {
   }
 });
 
+// Add processMap to track running Python processes
+const processMap = new Map();
+
+// Add cleanup function
+function cleanupProcess(processId) {
+  const process = processMap.get(processId);
+  if (process) {
+    process.kill();
+    processMap.delete(processId);
+    console.log(`Cleaned up process ${processId}`);
+  }
+}
+
 // Replace your existing /process/s3-video endpoint with this:
 app.post('/process/s3-video', async (req, res) => {
   let localPath;
   let result;
+  const processId = Date.now().toString();
+
+  // Set up cleanup on client disconnect
+  req.on('close', () => {
+    if (processMap.has(processId)) {
+      console.log('Client disconnected, cleaning up...');
+      cleanupProcess(processId);
+    }
+  });
 
   try {
     const { fileKey } = req.body;
@@ -274,6 +296,9 @@ app.post('/process/s3-video', async (req, res) => {
       localPath  // Use same path, Python will append _shortened
     ]);
 
+    // Store process reference
+    processMap.set(processId, pythonProcess);
+
     let pythonOutput = '';
     let pythonError = '';
 
@@ -291,6 +316,9 @@ app.post('/process/s3-video', async (req, res) => {
 
     await new Promise((resolve, reject) => {
       pythonProcess.on('close', async (code) => {
+        // Clean up process reference
+        processMap.delete(processId);
+        
         try {
           if (code !== 0) {
             throw new Error(`Python process failed with code ${code}: ${pythonError}`);
@@ -368,6 +396,8 @@ app.post('/process/s3-video', async (req, res) => {
     });
   } catch (error) {
     console.error('Error processing video:', error);
+    // Clean up process on error
+    cleanupProcess(processId);
     res.status(500).json({ 
       error: 'Failed to process video',
       details: error.message 
