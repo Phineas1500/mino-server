@@ -50,7 +50,8 @@ app.use(express.json());
 
 function getPythonCommand() {
   const venvPythonPaths = [
-    path.join(__dirname, '..', 'venv', 'bin', 'python'),
+    path.join(__dirname, '..', '..', 'venv', 'bin', 'python'),  // mino-study root venv
+    path.join(__dirname, '..', 'venv', 'bin', 'python'),        // mino-server venv
     path.join(__dirname, '..', 'bin', 'python'),
     path.join(__dirname, '..', 'env', 'bin', 'python'),
     path.join(__dirname, '..', 'venv', 'Scripts', 'python.exe'),
@@ -59,10 +60,12 @@ function getPythonCommand() {
 
   for (const venvPath of venvPythonPaths) {
     if (fs.existsSync(venvPath)) {
+      console.log('Using Python path:', venvPath);  // Add logging
       return venvPath;
     }
   }
   
+  console.log('Falling back to system Python');  // Add logging
   return 'python3'; // fallback to system python
 }
 

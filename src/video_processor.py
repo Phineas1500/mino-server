@@ -5,6 +5,39 @@ import sys
 import os
 import traceback
 from modal import Function
+from concurrent.futures import ThreadPoolExecutor
+import tempfile
+
+def compress_video(input_path):
+    """Compress video before sending to Modal"""
+    try:
+        video = mp.VideoFileClip(str(input_path))
+        
+        # Calculate target size (compress to 720p if larger)
+        target_width = min(1280, video.size[0])
+        target_height = min(720, video.size[1])
+        
+        if target_width < video.size[0] or target_height < video.size[1]:
+            video = video.resize(width=target_width, height=target_height)
+        
+        # Create temporary file for compressed video
+        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as temp_file:
+            temp_path = temp_file.name
+        
+        # Compress with lower bitrate and h264 codec
+        video.write_videofile(
+            temp_path,
+            codec='libx264',
+            audio_codec='aac',
+            preset='faster',  # Faster encoding, slightly larger file
+            bitrate='2000k'  # Adjust bitrate based on your needs
+        )
+        
+        video.close()
+        return temp_path
+    except Exception as e:
+        sys.stderr.write(f"Error in compress_video: {str(e)}\n")
+        return str(input_path)  # Return original path if compression fails
 
 def process_video(input_path, output_path):
     """
@@ -14,21 +47,37 @@ def process_video(input_path, output_path):
         sys.stderr.write(f"Starting process_video with input: {input_path}\n")
         input_path = Path(input_path)
         
-        # Read the video file
-        sys.stderr.write("Reading video file for Modal...\n")
-        with open(input_path, 'rb') as video_file:
+        # Compress video in a separate thread
+        with ThreadPoolExecutor() as executor:
+            compressed_path_future = executor.submit(compress_video, input_path)
+            
+            # While video is compressing, set up Modal connection
+            sys.stderr.write("Connecting to Modal service...\n")
+            modal_fn = Function.lookup("whisper-transcription", "process_video")
+            
+            # Wait for compression to complete
+            compressed_path = compressed_path_future.result()
+            sys.stderr.write(f"Video compressed: {compressed_path}\n")
+        
+        # Read the compressed video file
+        sys.stderr.write("Reading compressed video file...\n")
+        with open(compressed_path, 'rb') as video_file:
             video_data = video_file.read()
-        sys.stderr.write(f"Read {len(video_data)} bytes of video data\n")
+        sys.stderr.write(f"Read {len(video_data)} bytes of compressed video data\n")
         
-        sys.stderr.write("Connecting to Modal service...\n")
-        modal_fn = Function.lookup("whisper-transcription", "process_video")
+        # Clean up temporary compressed file if it's different from input
+        if compressed_path != str(input_path):
+            try:
+                os.remove(compressed_path)
+            except:
+                pass
         
-        # Just send the video data and filename without path
+        # Send to Modal for processing
         filename = input_path.name
         sys.stderr.write(f"Sending to Modal for processing with filename: {filename}\n")
         result = modal_fn.remote(video_data, filename)
         sys.stderr.write("Received result from Modal\n")
-
+        
         # Write transcript to file
         transcript_path = input_path.with_suffix('.txt')
         with open(transcript_path, 'w', encoding='utf-8') as f:
