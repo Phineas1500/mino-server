@@ -592,7 +592,7 @@ def cut_video_segments(video_path, segments, summary_data, min_segment_duration=
         return str(video_path)
 
 @app.function(
-    gpu="H100",
+    gpu="T4",
     image=image,
     timeout=1800,
     secrets=[Secret.from_name("openai-secret")]
@@ -827,7 +827,7 @@ async def optimize_playback_speed(segments):
         }
 
 @app.function(
-    gpu="H100",
+    gpu="T4",
     image=image,
     timeout=1800,
     secrets=[Secret.from_name("openai-secret")]
