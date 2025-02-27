@@ -227,7 +227,7 @@ function cleanupProcess(processId) {
   }
 }
 
-// Replace your existing /process/s3-video endpoint with this:
+// Replace the existing /process/s3-video endpoint with this updated version:
 app.post('/process/s3-video', async (req, res) => {
   let localPath;
   let result;
@@ -293,7 +293,7 @@ app.post('/process/s3-video', async (req, res) => {
     const pythonProcess = spawn(pythonCommand, [
       path.join(__dirname, 'video_processor.py'),
       localPath,
-      localPath  // Use same path, Python will append _shortened
+      localPath  // Use same path
     ]);
 
     // Store process reference
@@ -344,41 +344,19 @@ app.post('/process/s3-video', async (req, res) => {
               }
             }
 
-            // Upload shortened video to S3 if it exists
-            const shortenedKey = `shortened/${path.basename(fileKey)}`;
-            if (result.shortened_video_path && await fsPromises.access(result.shortened_video_path).then(() => true).catch(() => false)) {
-              await s3Client.send(new PutObjectCommand({
-                Bucket: process.env.AWS_BUCKET_NAME,
-                Key: shortenedKey,
-                Body: await fsPromises.readFile(result.shortened_video_path)
-              }));
-              console.log('Uploaded shortened video to S3:', shortenedKey);
-            }
-            
-            // Generate signed URLs for both videos
+            // Generate signed URL for the original video
             const videoCommand = new GetObjectCommand({
               Bucket: process.env.AWS_BUCKET_NAME,
               Key: fileKey
             });
-
-            const shortenedVideoCommand = new GetObjectCommand({
-              Bucket: process.env.AWS_BUCKET_NAME,
-              Key: shortenedKey
-            });
             
-            const [originalUrl, shortenedUrl] = await Promise.all([
-              getSignedUrl(s3Client, videoCommand, { expiresIn: 3600 }),
-              getSignedUrl(s3Client, shortenedVideoCommand, { expiresIn: 3600 })
-            ]);
-
-            console.log('Generated signed URLs for videos');
+            const originalUrl = await getSignedUrl(s3Client, videoCommand, { expiresIn: 3600 });
 
             res.json({
               success: true,
               originalUrl: originalUrl,
-              shortenedUrl: shortenedUrl,
               data: {
-                transcript: transcriptContent,
+                transcript: transcriptContent || result.transcript,
                 segments: result.segments || [],
                 summary: result.summary,
                 keyPoints: result.keyPoints,
@@ -409,13 +387,6 @@ app.post('/process/s3-video', async (req, res) => {
       if (localPath) {
         await fsPromises.unlink(localPath).catch(err => 
           console.error('Error removing original video temp file:', err)
-        );
-      }
-      
-      // Clean up shortened video using the path from Python output
-      if (result?.shortened_video_path) {
-        await fsPromises.unlink(result.shortened_video_path).catch(err => 
-          console.error('Error removing shortened video temp file:', err)
         );
       }
       

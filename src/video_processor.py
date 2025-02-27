@@ -1,123 +1,65 @@
-import moviepy.editor as mp
-from pathlib import Path
-import json
 import sys
+import json
 import os
 import traceback
-from modal import Function
-from concurrent.futures import ThreadPoolExecutor
 import tempfile
-
-def compress_video(input_path):
-    """Compress video before sending to Modal"""
-    try:
-        video = mp.VideoFileClip(str(input_path))
-        
-        # More aggressive resizing - target 480p for faster processing
-        target_width = min(854, video.size[0])  # 480p equivalent width
-        target_height = min(480, video.size[1])
-        
-        # Only resize if the video is larger than target
-        if target_width < video.size[0] or target_height < video.size[1]:
-            # Calculate aspect ratio
-            aspect = video.size[0] / video.size[1]
-            if aspect > (16/9):
-                # Wide video, fit to width
-                target_width = 854
-                target_height = int(854 / aspect)
-            else:
-                # Tall video, fit to height
-                target_height = 480
-                target_width = int(480 * aspect)
-            video = video.resize(width=target_width, height=target_height)
-        
-        # Reduce framerate if it's higher than 24fps
-        if video.fps > 24:
-            video = video.set_fps(24)
-        
-        # Create temporary file for compressed video
-        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as temp_file:
-            temp_path = temp_file.name
-        
-        # Compress with more aggressive settings
-        video.write_videofile(
-            temp_path,
-            codec='libx264',
-            audio_codec='aac',
-            preset='ultrafast',  # Fastest encoding preset
-            bitrate='1000k',    # Lower bitrate
-            audio_bitrate='96k', # Lower audio quality
-            threads=4,          # Use multiple threads
-            ffmpeg_params=[
-                '-tune', 'fastdecode',  # Optimize for decoding speed
-                '-maxrate', '1500k',    # Maximum bitrate
-                '-bufsize', '2000k',    # Buffer size
-                '-crf', '28',           # Constant Rate Factor (higher = lower quality, 28 is still acceptable)
-                '-level', '3.0'         # H.264 level (helps with compatibility)
-            ]
-        )
-        
-        video.close()
-        
-        # Verify the compressed file size
-        original_size = os.path.getsize(input_path)
-        compressed_size = os.path.getsize(temp_path)
-        sys.stderr.write(f"Original size: {original_size/1024/1024:.2f}MB, Compressed: {compressed_size/1024/1024:.2f}MB\n")
-        
-        return temp_path
-    except Exception as e:
-        sys.stderr.write(f"Error in compress_video: {str(e)}\n")
-        return str(input_path)  # Return original path if compression fails
+import subprocess
+from pathlib import Path
+from modal import Function
 
 def process_video(input_path, output_path):
     """
-    Process video and send to Modal for transcription, content analysis, and segment analysis
+    Extract audio from video and send only audio to Modal for processing
     """
-    temp_files = []  # Keep track of temporary files
-
     try:
-        sys.stderr.write(f"Starting process_video with input: {input_path}\n")
         input_path = Path(input_path)
-        
-        # Use ThreadPoolExecutor for parallel processing
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            # Start video compression
-            compressed_path_future = executor.submit(compress_video, input_path)
-            temp_files.append(compressed_path_future)  # Track for cleanup
-            
-            # While video is compressing, prepare Modal connection
-            modal_setup_future = executor.submit(Function.lookup, "whisper-transcription", "process_video")
-            
-            # Wait for both tasks to complete
-            compressed_path = compressed_path_future.result()
-            if compressed_path != str(input_path):
-                temp_files.append(Path(compressed_path))
-            modal_fn = modal_setup_future.result()
-            
-            sys.stderr.write(f"Video compressed: {compressed_path}\n")
-
-        # Read the compressed video file in chunks for memory efficiency
-        sys.stderr.write("Reading compressed video file...\n")
-        chunk_size = 1024 * 1024  # 1MB chunks
-        video_chunks = []
-        with open(compressed_path, 'rb') as video_file:
-            while chunk := video_file.read(chunk_size):
-                video_chunks.append(chunk)
-        video_data = b''.join(video_chunks)
-        sys.stderr.write(f"Read {len(video_data)} bytes of compressed video data\n")
-        
-        # Clean up temporary compressed file if it's different from input
-        if compressed_path != str(input_path):
-            try:
-                os.remove(compressed_path)
-            except:
-                pass
-        
-        # Send to Modal for processing
         filename = input_path.name
-        sys.stderr.write(f"Sending to Modal for processing with filename: {filename}\n")
-        result = modal_fn.remote(video_data, filename)
-        sys.stderr.write("Received result from Modal\n")
+        
+        sys.stderr.write(f"Starting process_video with input: {input_path}\n")
+        
+        # Create a temporary file for the audio
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_audio:
+            temp_audio_path = temp_audio.name
+        
+        try:
+            # Extract audio using ffmpeg (much faster than moviepy)
+            sys.stderr.write(f"Extracting audio to {temp_audio_path}...\n")
+            ffmpeg_cmd = [
+                'ffmpeg',
+                '-i', str(input_path),
+                '-vn',  # No video
+                '-acodec', 'pcm_s16le',  # PCM format
+                '-ar', '16000',  # 16kHz sample rate
+                '-ac', '1',  # Mono
+                '-y',  # Overwrite output file
+                temp_audio_path
+            ]
+            
+            # Run ffmpeg
+            subprocess.run(ffmpeg_cmd, check=True, stderr=subprocess.PIPE)
+            
+            # Check the size of the extracted audio
+            audio_size = os.path.getsize(temp_audio_path)
+            sys.stderr.write(f"Extracted audio: {audio_size} bytes\n")
+            
+            # Read the audio file (much smaller than the video)
+            with open(temp_audio_path, 'rb') as audio_file:
+                audio_data = audio_file.read()
+                
+            # Connect to Modal
+            sys.stderr.write("Connecting to Modal service...\n")
+            modal_fn = Function.lookup("whisper-transcription", "process_audio")
+            
+            # Send just the audio data to Modal
+            sys.stderr.write(f"Sending audio to Modal for processing from: {filename}\n")
+            result = modal_fn.remote(audio_data, filename)
+            sys.stderr.write("Received result from Modal\n")
+            
+        finally:
+            # Clean up the temporary file
+            if os.path.exists(temp_audio_path):
+                os.unlink(temp_audio_path)
+                sys.stderr.write(f"Cleaned up temporary audio file: {temp_audio_path}\n")
         
         # Write transcript to file
         transcript_path = input_path.with_suffix('.txt')
@@ -156,15 +98,6 @@ def process_video(input_path, output_path):
         print(json.dumps(error_output, ensure_ascii=False))
         sys.stdout.flush()
         raise
-    finally:
-        # Clean up all temporary files
-        for temp_file in temp_files:
-            try:
-                if isinstance(temp_file, Path) and temp_file.exists():
-                    temp_file.unlink()
-                    sys.stderr.write(f"Cleaned up temporary file: {temp_file}\n")
-            except Exception as e:
-                sys.stderr.write(f"Error cleaning up {temp_file}: {str(e)}\n")
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
@@ -174,6 +107,19 @@ if __name__ == "__main__":
             "error": "Insufficient arguments"
         }))
         sys.exit(1)
+    
+    # Add a test option for easier debugging
+    if sys.argv[1] == "test":
+        test_output = {
+            "status": "success",
+            "transcript": "This is a test transcript.",
+            "summary": "Test summary",
+            "keyPoints": ["Test point 1", "Test point 2"],
+            "flashcards": [{"question": "Test?", "answer": "Answer"}],
+            "segments": [{"start": 0, "end": 10, "text": "Test segment"}]
+        }
+        print(json.dumps(test_output))
+        sys.exit(0)
     
     input_path = sys.argv[1]
     output_path = sys.argv[2]

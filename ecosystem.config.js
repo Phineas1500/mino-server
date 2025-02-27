@@ -5,16 +5,30 @@ module.exports = {
     watch: true,
     ignore_watch: [
       'uploads',
-      'uploads/*',
+      'uploads/**',
       'src/uploads',
-      'src/uploads/*',
+      'src/uploads/**',
       'temp',
-      'temp/*',
+      'temp/**',
       'src/temp',
-      'src/temp/*',
-      'logs/*',
-      'node_modules'
+      'src/temp/**',
+      'logs',
+      'logs/**',
+      'node_modules',
+      '/tmp',
+      '*.mp4',
+      '*.wav',
+      '*.mov',
+      '*TEMP*',
+      '**/*TEMP*',
+      '**/tmp*'
     ],
+    watch_options: {
+      followSymlinks: false,
+      usePolling: true,
+      alwaysStat: false,
+      ignoreInitial: true
+    },
     env: {
       NODE_ENV: 'production',
       PORT: 3001

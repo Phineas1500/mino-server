@@ -219,57 +219,19 @@ async def process_batch_async(client, batch, batch_idx, total_batches):
         }
 
 async def process_segments_parallel(segments, client, batch_size=40, max_concurrent=3):
-    """Process segments in parallel with larger batches and controlled concurrency"""
+    """Process segments in parallel with controlled concurrency"""
     log(f"Starting parallel processing of {len(segments)} segments")
     
-    # Merge segments based on more aggressive criteria
-    merged_segments = []
-    current_segment = None
-    MIN_SEGMENT_DURATION = 5.0  # Minimum desired segment duration in seconds
-    MAX_SEGMENT_DURATION = 15.0  # Maximum segment duration to prevent too-long segments
-    
-    for segment in segments:
-        if not current_segment:
-            current_segment = segment.copy()
-            continue
-        
-        current_duration = current_segment["end"] - current_segment["start"]
-        segment_duration = segment["end"] - segment["start"]
-        combined_duration = current_duration + segment_duration
-        
-        # Merge criteria:
-        # 1. Current segment is too short OR
-        # 2. Combined duration is less than maximum AND
-        #    - There's semantic continuity (no long pause) OR
-        #    - Current segment is very short
-        time_gap = segment["start"] - current_segment["end"]
-        should_merge = (
-            current_duration < MIN_SEGMENT_DURATION or
-            (combined_duration < MAX_SEGMENT_DURATION and
-             (time_gap < 1.0 or current_duration < 2.0))
-        )
-        
-        if should_merge:
-            # Merge segments
-            current_segment["end"] = segment["end"]
-            current_segment["text"] += " " + segment["text"]
-        else:
-            # Add current segment and start a new one
-            merged_segments.append(current_segment)
-            current_segment = segment.copy()
-    
-    # Add the last segment
-    if current_segment:
-        merged_segments.append(current_segment)
+    # We're reverting to the original approach that doesn't merge segments
+    # This will keep the original whisper transcript segments as is
+    merged_segments = segments.copy()
     
     # Log merge results
     original_count = len(segments)
     merged_count = len(merged_segments)
-    average_duration_before = sum(s["end"] - s["start"] for s in segments) / original_count
-    average_duration_after = sum(s["end"] - s["start"] for s in merged_segments) / merged_count
+    average_duration = sum(s["end"] - s["start"] for s in merged_segments) / merged_count if merged_count > 0 else 0
     
-    log(f"Merged {original_count} segments into {merged_count} segments")
-    log(f"Average segment duration: {average_duration_before:.1f}s → {average_duration_after:.1f}s")
+    log(f"Using {merged_count} original segments with average duration: {average_duration:.1f}s")
     
     # Adjust batch size based on segment count
     dynamic_batch_size = min(max(10, merged_count // 4), batch_size)
@@ -368,223 +330,6 @@ image = (
         "pip install git+https://github.com/openai/whisper.git"
     )
 )
-
-def cut_video_segments(video_path, segments, summary_data, min_segment_duration=1.0, max_pause_duration=0.2):
-    """Cut video based on importance scores with smooth transitions and pause removal."""
-    try:
-        from moviepy.editor import VideoFileClip, concatenate_videoclips
-        
-        log("Loading video file...")
-        video = VideoFileClip(str(video_path), audio=True)
-        video_duration = video.duration
-        log(f"Video duration: {video_duration:.2f}s")
-        
-        # First, detect and remove pauses
-        log("Detecting pauses in audio...")
-        temp_audio = str(Path(video_path).with_suffix('.wav'))
-        video.audio.write_audiofile(
-            temp_audio,
-            codec='pcm_s16le',
-            fps=16000,
-            ffmpeg_params=["-ac", "1"],
-            verbose=False,
-            logger=None
-        )
-        
-        # Read audio and detect silent segments
-        audio_data, sample_rate = sf.read(temp_audio)
-        if len(audio_data.shape) > 1:
-            audio_data = np.mean(audio_data, axis=1)
-            
-        # Calculate frame energy in dB
-        frame_length = int(0.02 * sample_rate)  # 20ms frames
-        hop_length = frame_length // 2
-        frames = []
-        
-        for i in range(0, len(audio_data) - frame_length, hop_length):
-            frame = audio_data[i:i + frame_length]
-            energy = 20 * np.log10(np.mean(frame ** 2) + 1e-10)
-            frames.append(energy)
-            
-        frames = np.array(frames)
-        threshold_db = -40  # Threshold for silence detection
-        is_silent = frames < threshold_db
-        
-        # Convert frame indices to time
-        time_per_frame = hop_length / sample_rate
-        silent_segments = []
-        start_frame = None
-        
-        # Find continuous silent segments
-        for i in range(len(is_silent)):
-            if is_silent[i] and start_frame is None:
-                start_frame = i
-            elif not is_silent[i] and start_frame is not None:
-                duration = (i - start_frame) * time_per_frame
-                if duration >= max_pause_duration:
-                    start_time = start_frame * time_per_frame
-                    end_time = i * time_per_frame
-                    silent_segments.append((start_time, end_time))
-                start_frame = None
-        
-        # Check final segment
-        if start_frame is not None:
-            duration = (len(is_silent) - start_frame) * time_per_frame
-            if duration >= max_pause_duration:
-                start_time = start_frame * time_per_frame
-                end_time = len(is_silent) * time_per_frame
-                silent_segments.append((start_time, end_time))
-        
-        # Clean up audio file
-        Path(temp_audio).unlink()
-        
-        # Create segments without pauses
-        log(f"Found {len(silent_segments)} pauses to remove")
-        active_segments = []
-        current_time = 0
-        
-        for pause_start, pause_end in silent_segments:
-            if pause_start > current_time:
-                active_segments.append({
-                    "start": current_time,
-                    "end": pause_start
-                })
-            current_time = pause_end
-        
-        # Add final segment if needed
-        if current_time < video_duration:
-            active_segments.append({
-                "start": current_time,
-                "end": video_duration
-            })
-        
-        # Get OpenAI client for importance analysis
-        client = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-        
-        # Analyze segments importance
-        log("Analyzing segments importance with GPT-3.5-turbo...")
-        analyzed_segments = analyze_segments_importance(segments, client, summary_data)
-        
-        # Clean up segments
-        analyzed_segments = fix_overlapping_segments(analyzed_segments)
-        analyzed_segments = cleanup_segments(analyzed_segments, min_duration=min_segment_duration)
-        
-        # Ensure segments don't exceed video duration
-        cleaned_segments = []
-        for segment in analyzed_segments:
-            if segment["start"] >= video_duration:
-                continue
-            segment["end"] = min(segment["end"], video_duration)
-            cleaned_segments.append(segment)
-        
-        analyzed_segments = cleaned_segments
-        
-        # Process each segment with appropriate speed
-        clips_to_keep = []
-        total_original_duration = 0
-        total_kept_duration = 0
-        prev_clip = None
-        
-        for segment in segments:
-            try:
-                # Extract segment info
-                start_time = segment["start"]
-                end_time = segment["end"]
-                importance_score = float(segment.get("importance_score", 5))
-                # Use playback_speed if provided, otherwise calculate from importance_score
-                speed_factor = float(segment.get("playback_speed", 1.0 + (10 - importance_score) / 5))
-                
-                # Ensure speed is within bounds
-                speed_factor = max(1.0, min(2.5, speed_factor))
-                
-                # Get segment duration
-                duration = end_time - start_time
-                if duration < min_segment_duration:
-                    continue
-                
-                total_original_duration += duration
-                
-                # Extract and speed up clip
-                try:
-                    clip = video.subclip(start_time, end_time)
-                    
-                    # Apply speed adjustment
-                    if speed_factor != 1.0:
-                        clip = clip.speedx(speed_factor)
-                        if clip.audio is not None:
-                            try:
-                                # Adjust audio speed to match video
-                                new_fps = clip.audio.fps * speed_factor
-                                clip = clip.set_audio(clip.audio.set_fps(new_fps))
-                            except Exception as audio_e:
-                                log(f"Warning: Could not adjust audio speed: {str(audio_e)}", "WARNING")
-                    
-                    effective_duration = duration / speed_factor
-                    total_kept_duration += effective_duration
-                    
-                    # Add crossfade if not the first clip
-                    if prev_clip is not None:
-                        try:
-                            clip = clip.crossfadein(0.3)
-                        except Exception as fade_e:
-                            log(f"Warning: Could not add crossfade: {str(fade_e)}", "WARNING")
-                    
-                    clips_to_keep.append(clip)
-                    prev_clip = clip
-                    
-                except Exception as clip_e:
-                    log(f"Error processing clip at {start_time:.2f}s: {str(clip_e)}", "WARNING")
-                    continue
-                
-            except Exception as e:
-                log(f"Error processing segment: {str(e)}", "WARNING")
-                continue
-        
-        # Log statistics
-        if total_original_duration > 0:
-            reduction_percent = (1 - total_kept_duration / total_original_duration) * 100
-            log(f"""Video Processing Statistics:
-            Original Duration: {total_original_duration:.2f}s
-            Final Duration: {total_kept_duration:.2f}s
-            Reduction: {reduction_percent:.1f}%""", "INFO")
-        
-        if not clips_to_keep:
-            log("No valid segments found - using original video", "WARNING")
-            output_path = str(video_path)
-            video.close()
-            return output_path
-        
-        # Concatenate clips
-        try:
-            log(f"Concatenating {len(clips_to_keep)} clips...")
-            final_video = concatenate_videoclips(clips_to_keep)
-            
-            output_path = str(Path(video_path).with_stem(f"{Path(video_path).stem}_shortened"))
-            log(f"Writing shortened video to: {output_path}")
-            
-            final_video.write_videofile(
-                output_path,
-                codec="libx264",
-                audio_codec="aac",
-                verbose=False,
-                logger=None
-            )
-            
-            # Clean up
-            final_video.close()
-            for clip in clips_to_keep:
-                clip.close()
-            
-        except Exception as e:
-            log(f"Error during concatenation: {str(e)}", "ERROR")
-            output_path = str(video_path)
-        
-        video.close()
-        return output_path
-        
-    except Exception as e:
-        log(f"Error in cut_video_segments: {str(e)}", "ERROR")
-        return str(video_path)
 
 @app.function(
     gpu="T4",
@@ -827,44 +572,23 @@ async def optimize_playback_speed(segments):
     timeout=1800,
     secrets=[Secret.from_name("openai-secret")]
 )
-async def process_video(video_data: bytes, filename: str):
-    """Main function that handles video processing, transcription, and content analysis"""
+async def process_audio(audio_data: bytes, filename: str):
+    """Process just the audio track for faster upload and processing"""
     temp_files = []  # Keep track of temporary files
     try:
         # Create a safe filename without spaces
         safe_filename = filename.replace(" ", "_")
         
-        # Save video data temporarily
-        temp_video_path = Path("/tmp") / safe_filename
-        temp_files.append(temp_video_path)  # Track for cleanup
-        temp_video_path.write_bytes(video_data)
-        log(f"Saved video file: {temp_video_path} ({len(video_data)} bytes)")
+        # Save audio data temporarily
+        temp_audio_path = Path("/tmp") / f"{safe_filename}.wav"
+        temp_files.append(temp_audio_path)  # Track for cleanup
+        temp_audio_path.write_bytes(audio_data)
+        log(f"Saved audio file: {temp_audio_path} ({len(audio_data)} bytes)")
 
         # Create directories if they don't exist
-        temp_video_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_audio_path.parent.mkdir(parents=True, exist_ok=True)
 
         try:
-            # Extract audio for transcription
-            log("Extracting audio for transcription...")
-            video = VideoFileClip(str(temp_video_path))
-            if not video.audio:
-                raise ValueError("Video has no audio track")
-                
-            temp_audio_path = temp_video_path.with_suffix('.wav')
-            temp_files.append(temp_audio_path)  # Track for cleanup
-            
-            log(f"Writing audio to {temp_audio_path}")
-            video.audio.write_audiofile(
-                str(temp_audio_path),
-                codec='pcm_s16le',
-                fps=16000,
-                ffmpeg_params=["-ac", "1"],
-                verbose=True,
-                logger=None
-            )
-            video.close()
-            log("Audio extraction complete")
-
             # Verify audio file exists and has content
             if not temp_audio_path.exists():
                 raise FileNotFoundError(f"Audio file not created at {temp_audio_path}")
@@ -873,7 +597,7 @@ async def process_video(video_data: bytes, filename: str):
             if audio_size == 0:
                 raise ValueError("Audio file is empty")
 
-            # Transcribe with Whisper using supported options
+            # Transcribe with Whisper - using tiny model for speed
             log("Loading Whisper model...")
             model = whisper.load_model("tiny")
             
@@ -881,14 +605,7 @@ async def process_video(video_data: bytes, filename: str):
             result = model.transcribe(
                 str(temp_audio_path),
                 language='en',
-                verbose=True,
-                condition_on_previous_text=True,  # Help maintain context between segments
-                word_timestamps=False,  # Faster processing
-                # Using only supported options
-                fp16=False,  # Avoid GPU memory issues
-                beam_size=1,  # Faster processing
-                best_of=1,    # Faster processing
-                temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],  # Multiple temperatures for better results
+                verbose=True
             )
             
             if not result or not isinstance(result, dict):
@@ -899,16 +616,10 @@ async def process_video(video_data: bytes, filename: str):
             
             log(f"Transcription complete: {len(transcript)} characters, {len(segments)} segments")
 
-            # Clean up audio file early
-            if temp_audio_path.exists():
-                temp_audio_path.unlink()
-                log("Cleaned up audio file")
-
             # Process with OpenAI for summary, key points, and flashcards
             log("Generating educational content...")
             client = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
-            # More focused prompt for larger segments
             content_prompt = f"""Extract the core educational value from this transcript and return as JSON.
 
             ANALYSIS REQUIREMENTS:
@@ -982,32 +693,219 @@ async def process_video(video_data: bytes, filename: str):
 
             # Process segments using parallel processing
             log("Analyzing segments using parallel processing...")
+            analyzed_segments, stats = await process_segments_parallel(
+                segments, 
+                client,
+                batch_size=20,
+                max_concurrent=3
+            )
+
+            # Return the final result
+            return {
+                "status": "success",
+                "summary": content_data["summary"],
+                "keyPoints": content_data["keyPoints"][:5],
+                "flashcards": content_data["flashcards"][:5],
+                "transcript": transcript,
+                "segments": analyzed_segments,
+                "stats": stats
+            }
+
+        except Exception as e:
+            log(f"Error during audio processing: {str(e)}", "ERROR")
+            log(f"Stack trace: {traceback.format_exc()}", "ERROR")
+            raise
+
+    except Exception as e:
+        log(f"Error in process_audio: {str(e)}", "ERROR")
+        log(f"Stack trace: {traceback.format_exc()}", "ERROR")
+        return {
+            "status": "error",
+            "error": str(e),
+            "summary": "",
+            "keyPoints": [],
+            "flashcards": [],
+            "transcript": "",
+            "segments": [],
+            "stats": {
+                "total_segments": 0,
+                "skippable_segments": 0,
+                "total_duration": 0,
+                "skippable_duration": 0,
+                "skippable_percentage": 0
+            }
+        }
+    finally:
+        # Clean up temporary files
+        for temp_file in temp_files:
             try:
-                analyzed_segments, stats = await process_segments_parallel(
-                    segments, 
-                    client,
-                    batch_size=20,      # Number of segments per batch
-                    max_concurrent=5    # Maximum number of concurrent API calls
-                )
+                if temp_file.exists():
+                    temp_file.unlink()
+                    log(f"Cleaned up temporary file: {temp_file}")
             except Exception as e:
-                log(f"Error in segment analysis: {str(e)}", "ERROR")
-                # Return basic segment info if analysis fails
-                analyzed_segments = [{
-                    "start": s["start"],
-                    "end": s["end"],
-                    "text": s["text"],
-                    "importance_score": 5,
-                    "playback_speed": 1.0,
-                    "can_skip": False,
-                    "reason": "Error in analysis"
-                } for s in segments]
-                stats = {
-                    "total_segments": len(segments),
-                    "skippable_segments": 0,
-                    "total_duration": sum(s["end"] - s["start"] for s in segments),
-                    "skippable_duration": 0,
-                    "skippable_percentage": 0
+                log(f"Error cleaning up {temp_file}: {str(e)}", "WARNING")
+
+@app.function(
+    gpu="T4",
+    image=image,
+    timeout=1800,
+    secrets=[Secret.from_name("openai-secret")]
+)
+async def process_video(video_data: bytes, filename: str):
+    """Main function that handles video processing, transcription, and content analysis"""
+    temp_files = []  # Keep track of temporary files
+    try:
+        # Create a safe filename without spaces
+        safe_filename = filename.replace(" ", "_")
+        
+        # Save video data temporarily
+        temp_video_path = Path("/tmp") / safe_filename
+        temp_files.append(temp_video_path)  # Track for cleanup
+        temp_video_path.write_bytes(video_data)
+        log(f"Saved video file: {temp_video_path} ({len(video_data)} bytes)")
+
+        # Create directories if they don't exist
+        temp_video_path.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            # Extract audio for transcription using ffmpeg directly instead of moviepy
+            log("Extracting audio for transcription using ffmpeg...")
+            temp_audio_path = temp_video_path.with_suffix('.wav')
+            temp_files.append(temp_audio_path)  # Track for cleanup
+            
+            # FFmpeg command for audio extraction
+            ffmpeg_cmd = [
+                'ffmpeg',
+                '-i', str(temp_video_path),
+                '-vn',  # No video
+                '-acodec', 'pcm_s16le',  # PCM format
+                '-ar', '16000',  # 16kHz sample rate
+                '-ac', '1',  # Mono
+                '-y',  # Overwrite output file
+                str(temp_audio_path)
+            ]
+            
+            # Run ffmpeg
+            import subprocess
+            subprocess.run(ffmpeg_cmd, check=True, stderr=subprocess.PIPE)
+            
+            log(f"Audio extraction complete to {temp_audio_path}")
+
+            # Verify audio file exists and has content
+            if not temp_audio_path.exists():
+                raise FileNotFoundError(f"Audio file not created at {temp_audio_path}")
+            audio_size = temp_audio_path.stat().st_size
+            log(f"Audio file size: {audio_size} bytes")
+            if audio_size == 0:
+                raise ValueError("Audio file is empty")
+
+            # Transcribe with Whisper using tiny model
+            log("Loading Whisper model...")
+            model = whisper.load_model("tiny")
+            
+            log("Starting transcription...")
+            result = model.transcribe(
+                str(temp_audio_path),
+                language='en',
+                verbose=True
+            )
+            
+            if not result or not isinstance(result, dict):
+                raise ValueError(f"Invalid Whisper result: {result}")
+                
+            transcript = result.get("text", "")
+            segments = result.get("segments", [])
+            
+            log(f"Transcription complete: {len(transcript)} characters, {len(segments)} segments")
+
+            # Clean up audio file early
+            if temp_audio_path.exists():
+                temp_audio_path.unlink()
+                log("Cleaned up audio file")
+
+            # Process with OpenAI for summary, key points, and flashcards
+            log("Generating educational content...")
+            client = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+            content_prompt = f"""Extract the core educational value from this transcript and return as JSON.
+
+            ANALYSIS REQUIREMENTS:
+            1. Focus on identifying the central thesis and major supporting arguments
+            2. Prioritize conceptual understanding over details
+            3. Extract information that would appear on an exam
+            4. Ignore repetitions, examples, and tangents
+            5. Connect related ideas across different parts of the transcript
+
+            REQUIRED JSON FORMAT:
+            {{
+                "summary": "Clear, concise 2-paragraph summary of core concepts only",
+                "keyPoints": [
+                    "5 essential insights that represent the most important takeaways",
+                    ...4 more key points...
+                ],
+                "flashcards": [
+                    {{
+                        "question": "Conceptual question testing understanding",
+                        "answer": "Precise, factual answer focusing on core concept"
+                    }},
+                    ...4 more flashcards covering different concepts...
+                ]
+            }}
+
+            TRANSCRIPT:
+            {transcript[:4000]}"""  # Limit transcript length to avoid token limits
+
+            log("Generating educational content with OpenAI...")
+            content_response = client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are an expert at analyzing educational content and returning results in JSON format. Always respond with valid JSON that matches the requested structure."
+                    },
+                    {
+                        "role": "user",
+                        "content": content_prompt
+                    }
+                ],
+                temperature=0.5,
+                max_tokens=2000,
+                response_format={"type": "json_object"}
+            )
+
+            # Parse OpenAI response with error handling
+            try:
+                content_data = json.loads(content_response.choices[0].message.content)
+                required_fields = ["summary", "keyPoints", "flashcards"]
+                missing_fields = [field for field in required_fields if field not in content_data]
+                
+                if missing_fields:
+                    raise ValueError(f"Missing required fields in API response: {missing_fields}")
+                
+                if not isinstance(content_data["keyPoints"], list) or len(content_data["keyPoints"]) == 0:
+                    raise ValueError("Invalid or empty keyPoints in response")
+                    
+                if not isinstance(content_data["flashcards"], list) or len(content_data["flashcards"]) == 0:
+                    raise ValueError("Invalid or empty flashcards in response")
+                    
+            except (json.JSONDecodeError, KeyError, IndexError, ValueError) as e:
+                log(f"Error parsing OpenAI response: {str(e)}", "ERROR")
+                content_data = {
+                    "summary": "Error generating summary",
+                    "keyPoints": ["Error generating key points"],
+                    "flashcards": [{"question": "Error", "answer": "Error generating flashcards"}]
                 }
+                
+            log("Successfully generated educational content")
+
+            # Process segments using parallel processing
+            log("Analyzing segments using parallel processing...")
+            analyzed_segments, stats = await process_segments_parallel(
+                segments, 
+                client,
+                batch_size=20,      # Number of segments per batch
+                max_concurrent=3    # Maximum number of concurrent API calls
+            )
 
             # Return the final result with educational content and analyzed segments
             return {
@@ -1020,8 +918,9 @@ async def process_video(video_data: bytes, filename: str):
                 "stats": stats
             }
 
-        except Exception as api_error:
-            log(f"API Error: {str(api_error)}", "ERROR")
+        except Exception as e:
+            log(f"Error during video processing: {str(e)}", "ERROR")
+            log(f"Stack trace: {traceback.format_exc()}", "ERROR")
             raise
 
     except Exception as e:
