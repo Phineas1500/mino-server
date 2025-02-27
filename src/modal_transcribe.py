@@ -479,70 +479,65 @@ def cut_video_segments(video_path, segments, summary_data, min_segment_duration=
         
         analyzed_segments = cleaned_segments
         
-        # Process each active segment with appropriate speed
+        # Process each segment with appropriate speed
         clips_to_keep = []
         total_original_duration = 0
         total_kept_duration = 0
         prev_clip = None
         
-        for active_seg in active_segments:
-            # Find analyzed segments that overlap with this active segment
-            relevant_segments = [
-                seg for seg in analyzed_segments
-                if seg["end"] > active_seg["start"] and seg["start"] < active_seg["end"]
-            ]
-            
-            if not relevant_segments:
-                continue
-                
-            # Use average importance of overlapping segments
-            avg_importance = sum(float(s["importance_score"]) for s in relevant_segments) / len(relevant_segments)
-            duration = active_seg["end"] - active_seg["start"]
-            total_original_duration += duration
-            
+        for segment in segments:
             try:
-                clip = video.subclip(active_seg["start"], active_seg["end"])
+                # Extract segment info
+                start_time = segment["start"]
+                end_time = segment["end"]
+                importance_score = float(segment.get("importance_score", 5))
+                # Use playback_speed if provided, otherwise calculate from importance_score
+                speed_factor = float(segment.get("playback_speed", 1.0 + (10 - importance_score) / 5))
                 
-                # Apply speed adjustment based on importance
-                if avg_importance >= 0.8:  # Key content
-                    speed_factor = 1.0
-                elif avg_importance >= 0.6:
-                    speed_factor = 1.25
-                elif avg_importance >= 0.4:
-                    speed_factor = 1.75
-                elif avg_importance >= 0.2:
-                    speed_factor = 2.25
-                else:
-                    continue  # Skip very low importance segments
+                # Ensure speed is within bounds
+                speed_factor = max(1.0, min(2.5, speed_factor))
                 
+                # Get segment duration
+                duration = end_time - start_time
+                if duration < min_segment_duration:
+                    continue
+                
+                total_original_duration += duration
+                
+                # Extract and speed up clip
                 try:
-                    clip = clip.speedx(speed_factor)
-                    if clip.audio is not None:
-                        try:
-                            new_fps = clip.audio.fps * speed_factor
-                            clip = clip.set_audio(clip.audio.set_fps(new_fps))
-                        except Exception as audio_e:
-                            log(f"Warning: Could not adjust audio pitch: {str(audio_e)}", "WARNING")
+                    clip = video.subclip(start_time, end_time)
+                    
+                    # Apply speed adjustment
+                    if speed_factor != 1.0:
+                        clip = clip.speedx(speed_factor)
+                        if clip.audio is not None:
+                            try:
+                                # Adjust audio speed to match video
+                                new_fps = clip.audio.fps * speed_factor
+                                clip = clip.set_audio(clip.audio.set_fps(new_fps))
+                            except Exception as audio_e:
+                                log(f"Warning: Could not adjust audio speed: {str(audio_e)}", "WARNING")
                     
                     effective_duration = duration / speed_factor
+                    total_kept_duration += effective_duration
                     
-                except Exception as speed_e:
-                    log(f"Warning: Failed to adjust speed, using original clip: {str(speed_e)}", "WARNING")
-                    effective_duration = duration
-                
-                # Add crossfade if not the first clip
-                if prev_clip is not None:
-                    try:
-                        clip = clip.crossfadein(0.3)
-                    except Exception as fade_e:
-                        log(f"Warning: Could not add crossfade: {str(fade_e)}", "WARNING")
-                
-                total_kept_duration += effective_duration
-                clips_to_keep.append(clip)
-                prev_clip = clip
+                    # Add crossfade if not the first clip
+                    if prev_clip is not None:
+                        try:
+                            clip = clip.crossfadein(0.3)
+                        except Exception as fade_e:
+                            log(f"Warning: Could not add crossfade: {str(fade_e)}", "WARNING")
+                    
+                    clips_to_keep.append(clip)
+                    prev_clip = clip
+                    
+                except Exception as clip_e:
+                    log(f"Error processing clip at {start_time:.2f}s: {str(clip_e)}", "WARNING")
+                    continue
                 
             except Exception as e:
-                log(f"Error processing segment {active_seg['start']:.2f}s - {active_seg['end']:.2f}s: {str(e)}", "ERROR")
+                log(f"Error processing segment: {str(e)}", "WARNING")
                 continue
         
         # Log statistics
