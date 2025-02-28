@@ -105,9 +105,21 @@ async def process_batch_async(client, batch, batch_idx, total_batches):
         importance_prompt = f"""Rate these lecture segments and return the analysis in JSON format.
 
         RATING RULES:
-        - 10-8: Essential content (core concepts, definitions, key principles)
-        - 7-5: Supporting content (examples, explanations, context)
-        - 4-1: Supplementary content (repetition, tangents, filler)
+        - 10-8: Essential content (core concepts, definitions, key principles) → 1.0x speed
+        - 7-5: Supporting content (examples, explanations, context) → 1.5x speed
+        - 4-1: Supplementary content (repetition, tangents, filler) → 2.0-2.5x speed
+
+        PLAYBACK SPEED MUST follow this strict formula:
+        - For score 10: Use speed 1.0
+        - For score 9: Use speed 1.0
+        - For score 8: Use speed 1.1
+        - For score 7: Use speed 1.3
+        - For score 6: Use speed 1.5
+        - For score 5: Use speed 1.7
+        - For score 4: Use speed 1.9
+        - For score 3: Use speed 2.1
+        - For score 2: Use speed 2.3
+        - For score 1: Use speed 2.5
 
         SEGMENTS TO ANALYZE:
         {segments_text}
@@ -117,7 +129,7 @@ async def process_batch_async(client, batch, batch_idx, total_batches):
             "ratings": [
                 {{
                     "score": number,          // 1-10 rating
-                    "speed": number,          // 1.0-2.5 playback speed
+                    "speed": number,          // MUST follow the formula above
                     "skip": boolean,          // true if score ≤ 3
                     "key_point": "string"     // Brief summary
                 }}
@@ -129,7 +141,7 @@ async def process_batch_async(client, batch, batch_idx, total_batches):
                 model="gpt-3.5-turbo",
                 messages=[{
                     "role": "system",
-                    "content": "You analyze educational content and return ratings in JSON format. Always respond with valid JSON matching the requested structure."
+                    "content": "You analyze educational content and return ratings in JSON format. Follow the playback speed formula precisely based on the score. Always respond with valid JSON matching the requested structure."
                 }, {
                     "role": "user",
                     "content": importance_prompt
@@ -160,7 +172,26 @@ async def process_batch_async(client, batch, batch_idx, total_batches):
                 importance_score = float(rating.get('score', 5))
                 importance_score = max(1, min(10, importance_score))
                 
-                playback_speed = float(rating.get('speed', 1.5))
+                # Calculate playback speed based on score using our formula
+                # This ensures a direct relationship between score and speed
+                playback_speed_map = {
+                    10: 1.0, 9: 1.0, 8: 1.1,
+                    7: 1.3, 6: 1.5, 5: 1.7,
+                    4: 1.9, 3: 2.1, 2: 2.3, 1: 2.5
+                }
+                default_speed = 1.5
+                
+                # First try to use the speed from the API response
+                api_speed = float(rating.get('speed', 0.0))
+                
+                # If API speed is valid, use it, otherwise calculate from the score
+                if 1.0 <= api_speed <= 2.5:
+                    playback_speed = api_speed
+                else:
+                    # Fallback to calculating from score
+                    playback_speed = playback_speed_map.get(int(importance_score), default_speed)
+                
+                # Ensure speed is within bounds
                 playback_speed = max(1.0, min(2.5, playback_speed))
                 
                 can_skip = bool(rating.get('skip', importance_score <= 3))
@@ -217,7 +248,7 @@ async def process_batch_async(client, batch, batch_idx, total_batches):
             "total_duration": sum(seg["end"] - seg["start"] for seg in batch),
             "skippable_duration": 0
         }
-
+        
 async def process_segments_parallel(segments, client, batch_size=40, max_concurrent=3):
     """Process segments in parallel with controlled concurrency"""
     log(f"Starting parallel processing of {len(segments)} segments")
