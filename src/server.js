@@ -11,6 +11,7 @@ const { S3Client, GetObjectCommand, PutObjectCommand } = require('@aws-sdk/clien
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { generatePresignedUrl, s3Client } = require('./services/s3');
 const { promises: fsPromises } = require('fs');
+const { v4: uuidv4 } = require('uuid'); // Import uuid for generating job IDs
 
 // Add the error handling right after imports
 process.on('unhandledRejection', (reason, promise) => {
@@ -30,6 +31,9 @@ console.log('AWS Config:', {
 
 const app = express();
 const PORT = process.env.PORT;
+
+// In-memory store for job statuses
+const jobStore = new Map();
 
 app.use((req, res, next) => {
   console.log(`${req.method} ${req.path}`, {
@@ -86,113 +90,8 @@ const storage = multer.diskStorage({
 
 const upload = multer({ storage });
 
-// Upload and process endpoint
-app.post('/upload', upload.single('video'), async (req, res) => {
-  try {
-    console.log('=== Upload Request Started ===');
-    console.log('Headers:', req.headers);
-    console.log('Body:', req.body);
-
-    if (!req.file) {
-      console.log('No file received in request');
-      return res.status(400).json({ error: 'No file uploaded' });
-    }
-
-    console.log('File details:', {
-      originalname: req.file.originalname,
-      mimetype: req.file.mimetype,
-      size: req.file.size,
-      path: req.file.path
-    });
-    
-    const inputPath = req.file.path;
-    const outputPath = inputPath;
-
-    console.log('Starting transcription process...');
-    console.log('Input path:', inputPath);
-    
-    const pythonCommand = getPythonCommand();
-    const pythonProcess = spawn(pythonCommand, [
-      path.join(__dirname, 'video_processor.py'),
-      inputPath,
-      outputPath
-    ]);
-    
-
-    let pythonOutput = '';
-    let pythonError = '';
-
-    pythonProcess.stdout.on('data', (data) => {
-      const output = data.toString();
-      console.log('Raw Python output:', output); // Add this line
-      pythonOutput += output;
-    });
-
-    pythonProcess.stderr.on('data', (data) => {
-      const error = data.toString();
-      console.log('Python error:', error);
-      pythonError += error;
-    });
-
-    pythonProcess.on('close', (code) => {
-      if (code !== 0) {
-        console.error('Python process failed with code:', code);
-        return res.status(500).json({ 
-          success: false, 
-          error: 'Failed to process video',
-          pythonError 
-        });
-      }
-
-      try {
-        // Find the last complete JSON object in the output
-        const matches = pythonOutput.match(/\{(?:[^{}]|(\{[^{}]*\}))*\}/g);
-        if (!matches) {
-          throw new Error('No valid JSON found in Python output');
-        }
-        // Take the last complete JSON object
-        const lastJson = matches[matches.length - 1];
-        const result = JSON.parse(lastJson);
-        
-        if (result.status === 'success') {
-          // Read the transcript file
-          const transcriptContent = fs.readFileSync(result.transcript_file, 'utf8');
-          
-          res.json({
-            success: true,
-            url: `http://localhost:${PORT}/video/${path.basename(inputPath)}`,
-            data: {
-              transcript: transcriptContent,
-              segments: result.segments,
-              summary: result.summary,
-              keyPoints: result.keyPoints,
-              flashcards: result.flashcards
-            }
-          });
-        } else {
-          res.status(500).json({ 
-            success: false, 
-            error: result.error || 'Processing failed' 
-          });
-        }
-      } catch (error) {
-        console.error('Error parsing Python output:', error);
-        console.error('Raw Python output received:', pythonOutput); // Add this line
-        res.status(500).json({ 
-          success: false, 
-          error: 'Failed to parse Python output',
-          pythonOutput
-        });
-      }
-    });
-  } catch (error) {
-    console.error('Server error:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: error.message 
-    });
-  }
-});
+// Upload and process endpoint (Deprecated - Keep for reference or remove later)
+// app.post('/upload', ...); // Consider removing or commenting out if not used
 
 app.post('/s3/presigned', async (req, res) => {
   try {
@@ -217,243 +116,261 @@ app.post('/s3/presigned', async (req, res) => {
 // Add a set to track currently processing file keys
 const processingFiles = new Set();
 
-// Add processMap to track running Python processes
-const processMap = new Map();
+// Add processMap to track running Python processes (Optional, can be removed if cleanup is handled differently)
+// const processMap = new Map(); // We might not need this if we rely on jobStore
 
-// Add cleanup function
-function cleanupProcess(processId) {
-  const process = processMap.get(processId);
-  if (process) {
-    process.kill();
-    processMap.delete(processId);
-    console.log(`Cleaned up process ${processId}`);
-  }
-}
+// Add cleanup function (Optional, can be removed if cleanup is handled differently)
+// function cleanupProcess(processId) { ... }
 
-// Replace the existing /process/s3-video endpoint with this updated version:
+// --- Modified /process/s3-video Endpoint ---
 app.post('/process/s3-video', async (req, res) => {
-  let localPath;
-  let result;
-  const processId = Date.now().toString();
-  let fileKey; // Define fileKey here to access in finally block
+  let localPath; // To be used in the 'close' handler for cleanup
+  let transcriptFilePath; // To store the path for cleanup
+  const fileKey = req.body.fileKey;
 
-  // Set up cleanup on client disconnect
-  req.on('close', () => {
-    if (processMap.has(processId)) {
-      console.log('Client disconnected, cleaning up...');
-      cleanupProcess(processId);
-      // Also remove from processingFiles if the request is aborted mid-process
-      if (fileKey && processingFiles.has(fileKey)) {
-        processingFiles.delete(fileKey);
-        console.log(`Removed lock for ${fileKey} due to client disconnect`);
+  if (!fileKey) {
+    return res.status(400).json({ error: 'fileKey is required' });
+  }
+
+  // --- Lock Check ---
+  if (processingFiles.has(fileKey)) {
+    console.log(`Processing already in progress for key: ${fileKey}`);
+    return res.status(409).json({
+      error: 'Processing already in progress for this file. Please wait.'
+    });
+  }
+
+  // --- Acquire Lock ---
+  processingFiles.add(fileKey);
+  console.log(`Acquired lock for key: ${fileKey}`);
+
+  // Generate Job ID and store initial state
+  const jobId = uuidv4();
+  jobStore.set(jobId, { status: 'processing', startTime: Date.now(), fileKey: fileKey });
+  console.log(`Job ${jobId} started for fileKey: ${fileKey}`);
+
+  // Immediately return 202 Accepted
+  res.status(202).json({ jobId: jobId });
+
+  // --- Start background processing ---
+  // Use a self-executing async function to handle the background task
+  // This avoids blocking the main request handler
+  (async () => {
+    try {
+      console.log(`[Job ${jobId}] Processing video from S3: ${fileKey}`);
+
+      const tempDir = path.join(__dirname, '..', 'temp');
+      await fsPromises.mkdir(tempDir, { recursive: true });
+      const uniqueTempFilename = `${Date.now()}-${path.basename(fileKey)}`;
+      localPath = path.join(tempDir, uniqueTempFilename);
+
+      const getCommand = new GetObjectCommand({
+        Bucket: process.env.AWS_BUCKET_NAME,
+        Key: fileKey
+      });
+      console.log(`[Job ${jobId}] Fetching from S3:`, { bucket: process.env.AWS_BUCKET_NAME, key: fileKey });
+      const response = await s3Client.send(getCommand);
+      const readStream = response.Body;
+
+      if (!readStream) {
+        throw new Error('Failed to get video stream from S3');
       }
-    }
-  });
 
-  try {
-    // Extract fileKey earlier
-    fileKey = req.body.fileKey;
+      const writeStream = await fsPromises.open(localPath, 'w');
+      const chunks = [];
+      for await (const chunk of readStream) {
+        chunks.push(chunk);
+      }
+      await writeStream.write(Buffer.concat(chunks));
+      await writeStream.close();
+      console.log(`[Job ${jobId}] Downloaded file from S3 to: ${localPath}`);
 
-    if (!fileKey) {
-      return res.status(400).json({
-        error: 'fileKey is required'
+      const pythonCommand = getPythonCommand();
+      const pythonProcess = spawn(pythonCommand, [
+        path.join(__dirname, 'video_processor.py'),
+        localPath,
+        localPath // Output base name
+      ]);
+
+      let pythonOutput = '';
+      let pythonError = '';
+
+      pythonProcess.stdout.on('data', (data) => {
+        const output = data.toString();
+        console.log(`[Job ${jobId}] Python output:`, output);
+        pythonOutput += output;
       });
-    }
 
-    // --- Lock Check ---
-    if (processingFiles.has(fileKey)) {
-      console.log(`Processing already in progress for key: ${fileKey}`);
-      // Send a 409 Conflict status code
-      return res.status(409).json({
-        error: 'Processing already in progress for this file. Please wait.'
+      pythonProcess.stderr.on('data', (data) => {
+        const error = data.toString();
+        console.log(`[Job ${jobId}] Python error:`, error);
+        pythonError += error;
       });
-    }
-    // --- Acquire Lock ---
-    processingFiles.add(fileKey);
-    console.log(`Acquired lock for key: ${fileKey}`);
 
-
-    console.log('Processing video from S3:', fileKey);
-
-    // Create temp directory if it doesn't exist
-    const tempDir = path.join(__dirname, '..', 'temp');
-    await fsPromises.mkdir(tempDir, { recursive: true });
-
-    // Use a unique name for the local temp file to avoid conflicts
-    const uniqueTempFilename = `${Date.now()}-${path.basename(fileKey)}`;
-    localPath = path.join(tempDir, uniqueTempFilename);
-
-    // Download original video from S3
-    const getCommand = new GetObjectCommand({
-      Bucket: process.env.AWS_BUCKET_NAME,
-      Key: fileKey
-    });
-
-    console.log('Fetching from S3:', {
-      bucket: process.env.AWS_BUCKET_NAME,
-      key: fileKey
-    });
-
-    const response = await s3Client.send(getCommand);
-    const readStream = response.Body;
-
-    if (!readStream) {
-      // Release lock before throwing error
-      processingFiles.delete(fileKey);
-      console.log(`Released lock for key: ${fileKey} (S3 stream error)`);
-      throw new Error('Failed to get video stream from S3');
-    }
-
-    // Write the original video locally
-    const writeStream = await fsPromises.open(localPath, 'w');
-    const chunks = [];
-    for await (const chunk of readStream) {
-      chunks.push(chunk);
-    }
-    await writeStream.write(Buffer.concat(chunks));
-    await writeStream.close();
-
-    console.log('Downloaded file from S3 to:', localPath);
-
-    // Process the video using video_processor.py
-    const pythonCommand = getPythonCommand();
-    const pythonProcess = spawn(pythonCommand, [
-      path.join(__dirname, 'video_processor.py'),
-      localPath,
-      localPath  // Use same path for output base name, python script handles suffixes
-    ]);
-
-    // Store process reference
-    processMap.set(processId, pythonProcess);
-
-    let pythonOutput = '';
-    let pythonError = '';
-
-    pythonProcess.stdout.on('data', (data) => {
-      const output = data.toString();
-      console.log('Python output:', output);
-      pythonOutput += output;
-    });
-
-    pythonProcess.stderr.on('data', (data) => {
-      const error = data.toString();
-      console.log('Python error:', error);
-      pythonError += error;
-    });
-
-    await new Promise((resolve, reject) => {
       pythonProcess.on('close', async (code) => {
-        // Clean up process reference
-        processMap.delete(processId);
+        console.log(`[Job ${jobId}] Python process closed with code: ${code}`);
+        let finalResult; // To store parsed result for cleanup
 
         try {
           if (code !== 0) {
             throw new Error(`Python process failed with code ${code}: ${pythonError}`);
           }
 
-          // Parse Python output
           const matches = pythonOutput.match(/\{(?:[^{}]|(\{[^{}]*\}))*\}/g);
           if (!matches) {
             throw new Error('No valid JSON found in Python output');
           }
+          finalResult = JSON.parse(matches[matches.length - 1]);
+          transcriptFilePath = finalResult?.transcript_file; // Store for cleanup
 
-          result = JSON.parse(matches[matches.length - 1]);
-
-          if (result.status === 'success') {
-            // Read the transcript file safely
+          if (finalResult.status === 'success') {
             let transcriptContent = '';
-            if (result.transcript_file) {
+            if (finalResult.transcript_file) {
               try {
-                // Check if file exists before reading
-                await fsPromises.access(result.transcript_file, fs.constants.F_OK);
-                transcriptContent = await fsPromises.readFile(result.transcript_file, 'utf8');
+                await fsPromises.access(finalResult.transcript_file, fs.constants.F_OK);
+                transcriptContent = await fsPromises.readFile(finalResult.transcript_file, 'utf8');
               } catch (err) {
-                console.warn(`Could not read transcript file (${result.transcript_file}):`, err.message);
-                transcriptContent = result.transcript || ''; // Fallback
+                console.warn(`[Job ${jobId}] Could not read transcript file (${finalResult.transcript_file}):`, err.message);
+                transcriptContent = finalResult.transcript || ''; // Fallback
               }
             } else {
-               transcriptContent = result.transcript || ''; // Fallback
+               transcriptContent = finalResult.transcript || ''; // Fallback
             }
 
-            // Generate signed URL for the original video
             const videoCommand = new GetObjectCommand({
               Bucket: process.env.AWS_BUCKET_NAME,
               Key: fileKey
             });
-
             const originalUrl = await getSignedUrl(s3Client, videoCommand, { expiresIn: 3600 });
 
-            res.json({
-              success: true,
-              originalUrl: originalUrl,
+            // Update job store on success
+            jobStore.set(jobId, {
+              status: 'complete',
               data: {
+                originalUrl: originalUrl,
                 transcript: transcriptContent,
-                segments: result.segments || [],
-                summary: result.summary,
-                keyPoints: result.keyPoints,
-                flashcards: result.flashcards
-              }
+                segments: finalResult.segments || [],
+                summary: finalResult.summary,
+                keyPoints: finalResult.keyPoints,
+                flashcards: finalResult.flashcards
+              },
+              endTime: Date.now()
             });
-            resolve();
+            console.log(`[Job ${jobId}] Completed successfully.`);
+
           } else {
-            throw new Error(result.error || 'Processing failed');
+            throw new Error(finalResult.error || 'Processing failed in Python script');
           }
         } catch (error) {
-          reject(error);
+          console.error(`[Job ${jobId}] Error during Python process close/parsing:`, error);
+          // Update job store on error
+          jobStore.set(jobId, {
+            status: 'error',
+            message: error.message || 'An unknown error occurred during processing.',
+            details: error.stack, // Optional: include stack trace
+            endTime: Date.now()
+          });
+        } finally {
+          // --- Release Lock ---
+          if (processingFiles.has(fileKey)) {
+            processingFiles.delete(fileKey);
+            console.log(`[Job ${jobId}] Released lock for key: ${fileKey}`);
+          }
+
+          // --- Clean up temporary files ---
+          console.log(`[Job ${jobId}] Starting cleanup...`);
+          try {
+            if (localPath) {
+              await fsPromises.access(localPath, fs.constants.F_OK);
+              await fsPromises.unlink(localPath);
+              console.log(`[Job ${jobId}] Cleaned up temp video file: ${localPath}`);
+            } else {
+               console.log(`[Job ${jobId}] No local video path to clean.`);
+            }
+          } catch (err) {
+            if (err.code !== 'ENOENT') {
+              console.error(`[Job ${jobId}] Error removing temp video file ${localPath}:`, err);
+            } else {
+              console.log(`[Job ${jobId}] Temp video file ${localPath} already removed or never existed.`);
+            }
+          }
+          try {
+            if (transcriptFilePath) {
+               await fsPromises.access(transcriptFilePath, fs.constants.F_OK);
+               await fsPromises.unlink(transcriptFilePath);
+               console.log(`[Job ${jobId}] Cleaned up temp transcript file: ${transcriptFilePath}`);
+            } else {
+               console.log(`[Job ${jobId}] No transcript file path to clean.`);
+            }
+          } catch (err) {
+             if (err.code !== 'ENOENT') {
+                console.error(`[Job ${jobId}] Error removing temp transcript file ${transcriptFilePath}:`, err);
+             } else {
+                console.log(`[Job ${jobId}] Temp transcript file ${transcriptFilePath} already removed or never existed.`);
+             }
+          }
+          console.log(`[Job ${jobId}] Cleanup finished.`);
         }
       });
-    });
-  } catch (error) {
-    console.error('Error processing video:', error);
-    // Clean up process on error
-    cleanupProcess(processId);
-    res.status(500).json({
-      error: 'Failed to process video',
-      details: error.message
-    });
-  } finally {
-    // --- Release Lock ---
-    if (fileKey && processingFiles.has(fileKey)) {
-      processingFiles.delete(fileKey);
-      console.log(`Released lock for key: ${fileKey}`);
-    }
 
-    // Clean up temporary files safely
-    try {
-      // Clean up original video file
-      if (localPath) {
-        try {
-            await fsPromises.access(localPath, fs.constants.F_OK); // Check existence
-            await fsPromises.unlink(localPath);
-            console.log(`Cleaned up temp video file: ${localPath}`);
-        } catch (accessErr) {
-            if (accessErr.code !== 'ENOENT') { // Ignore 'file not found'
-                console.error(`Error checking/removing temp video file ${localPath}:`, accessErr);
-            } else {
-                 console.log(`Temp video file ${localPath} already removed.`);
-            }
+      pythonProcess.on('error', (err) => {
+        console.error(`[Job ${jobId}] Failed to start Python process:`, err);
+        // Update job store on spawn error
+        jobStore.set(jobId, {
+          status: 'error',
+          message: 'Failed to start processing task.',
+          details: err.message,
+          endTime: Date.now()
+        });
+        // Release lock if spawn fails
+        if (processingFiles.has(fileKey)) {
+          processingFiles.delete(fileKey);
+          console.log(`[Job ${jobId}] Released lock for key: ${fileKey} (spawn error)`);
         }
-      }
+        // Attempt cleanup even on spawn error
+        if (localPath) {
+          fsPromises.unlink(localPath).catch(e => console.error(`[Job ${jobId}] Cleanup error after spawn fail:`, e));
+        }
+      });
 
-      // Clean up transcript file
-      if (result?.transcript_file) {
-         try {
-            await fsPromises.access(result.transcript_file, fs.constants.F_OK); // Check existence
-            await fsPromises.unlink(result.transcript_file);
-            console.log(`Cleaned up temp transcript file: ${result.transcript_file}`);
-         } catch (accessErr) {
-            if (accessErr.code !== 'ENOENT') { // Ignore 'file not found'
-                console.error(`Error checking/removing temp transcript file ${result.transcript_file}:`, accessErr);
-            } else {
-                 console.log(`Temp transcript file ${result.transcript_file} already removed.`);
-            }
-         }
+    } catch (error) {
+      console.error(`[Job ${jobId}] Error in background processing setup:`, error);
+      // Update job store on setup error (e.g., S3 download failed)
+      jobStore.set(jobId, {
+        status: 'error',
+        message: error.message || 'Failed during setup before processing could start.',
+        details: error.stack,
+        endTime: Date.now()
+      });
+      // Release lock on setup error
+      if (processingFiles.has(fileKey)) {
+        processingFiles.delete(fileKey);
+        console.log(`[Job ${jobId}] Released lock for key: ${fileKey} (setup error)`);
       }
-    } catch (err) {
-      console.error('Error in cleanup:', err);
+       // Attempt cleanup even on setup error
+       if (localPath) {
+         fsPromises.unlink(localPath).catch(e => console.error(`[Job ${jobId}] Cleanup error after setup fail:`, e));
+       }
     }
-  }
+  })(); // Immediately invoke the async function
+
 });
+
+// --- New GET /process/status/:jobId Endpoint ---
+app.get('/process/status/:jobId', (req, res) => {
+  const jobId = req.params.jobId;
+  const job = jobStore.get(jobId);
+
+  if (!job) {
+    return res.status(404).json({ status: 'not_found', message: 'Job not found.' });
+  }
+
+  // Optionally remove sensitive details before sending
+  const { details, ...jobStatusToSend } = job;
+
+  res.json(jobStatusToSend);
+});
+
 
 // Test endpoint
 app.post('/api/transcript/test', (req, res) => {
@@ -494,8 +411,8 @@ app.post('/api/transcript/test', (req, res) => {
   });
 });
 
-// Serve uploaded videos
-app.use('/video', express.static(path.join(__dirname, '..', 'uploads')));
+// Serve uploaded videos (If needed for direct access, otherwise remove)
+// app.use('/video', express.static(path.join(__dirname, '..', 'uploads')));
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
