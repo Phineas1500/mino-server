@@ -1,4 +1,3 @@
-// Modify the top imports in server.js
 require('dotenv').config();
 
 const express = require('express');
@@ -13,7 +12,6 @@ const { generatePresignedUrl, s3Client } = require('./services/s3');
 const { promises: fsPromises } = require('fs');
 const { v4: uuidv4 } = require('uuid'); // Import uuid for generating job IDs
 
-// Add the error handling right after imports
 process.on('unhandledRejection', (reason, promise) => {
   console.error('Unhandled Rejection at:', promise, 'reason:', reason);
 });
@@ -357,141 +355,151 @@ app.post('/process/s3-video', async (req, res) => {
 
 });
 
-// --- New YouTube URL Processing Endpoint ---
+// --- Modified YouTube URL Processing Endpoint (Fully Asynchronous) ---
 app.post('/process/youtube-url', async (req, res) => {
   const { youtubeUrl } = req.body;
-  let tempVideoPath; // Path for the video downloaded by yt-dlp
-  let fileKey; // S3 key for the uploaded video
+  let tempVideoPath; // Keep track for cleanup in background task
+  let fileKey; // Keep track for cleanup/locking in background task
 
   if (!youtubeUrl) {
     return res.status(400).json({ error: 'youtubeUrl is required' });
   }
 
-  // Basic URL validation (can be improved)
+  // Basic URL validation
   if (!youtubeUrl.includes('youtube.com') && !youtubeUrl.includes('youtu.be')) {
       return res.status(400).json({ error: 'Invalid YouTube URL provided' });
   }
 
-  const jobId = uuidv4(); // Generate Job ID early for logging
+  // 1. Generate Job ID early
+  const jobId = uuidv4();
 
-  try {
-    console.log(`[Job ${jobId}] Received YouTube URL: ${youtubeUrl}`);
+  // 2. Store Initial Job State ('downloading')
+  jobStore.set(jobId, {
+    status: 'downloading', // Initial status
+    startTime: Date.now(),
+    source: 'youtube',
+    originalUrl: youtubeUrl
+  });
+  console.log(`[Job ${jobId}] Registered for YouTube URL: ${youtubeUrl}. Status: downloading.`);
 
-    // --- Download using yt-dlp ---
-    const tempDir = path.join(__dirname, '..', 'temp');
-    await fsPromises.mkdir(tempDir, { recursive: true });
-    // Unique name for the initial download
-    const uniqueDownloadFilename = `${jobId}-youtube-download.mp4`;
-    tempVideoPath = path.join(tempDir, uniqueDownloadFilename);
+  // 3. Return 202 Accepted Immediately
+  res.status(202).json({ jobId: jobId });
 
-    console.log(`[Job ${jobId}] Starting yt-dlp download to: ${tempVideoPath}`);
-    const ytdlpProcess = spawn('yt-dlp', [
-      '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best', // Format selection
-      '-o', tempVideoPath, // Output path
-      '--', // End of options
-      youtubeUrl
-    ]);
-
-    let ytdlpError = '';
-    ytdlpProcess.stderr.on('data', (data) => {
-      // yt-dlp often prints progress to stderr
-      console.log(`[Job ${jobId}] yt-dlp stderr: ${data.toString().trim()}`);
-      ytdlpError += data.toString();
-    });
-    ytdlpProcess.stdout.on('data', (data) => {
-      console.log(`[Job ${jobId}] yt-dlp stdout: ${data.toString().trim()}`);
-    });
-
-    const downloadExitCode = await new Promise((resolve, reject) => {
-      ytdlpProcess.on('close', resolve);
-      ytdlpProcess.on('error', reject);
-    });
-
-    if (downloadExitCode !== 0) {
-      throw new Error(`yt-dlp failed with code ${downloadExitCode}. Error: ${ytdlpError}`);
-    }
-    console.log(`[Job ${jobId}] yt-dlp download successful.`);
-
-    // --- Upload to S3 ---
-    fileKey = `uploads/youtube-${jobId}-${path.basename(tempVideoPath)}`;
-    console.log(`[Job ${jobId}] Uploading ${tempVideoPath} to S3 with key: ${fileKey}`);
-
-    const fileStream = fs.createReadStream(tempVideoPath);
-    const uploadCommand = new PutObjectCommand({
-        Bucket: process.env.AWS_BUCKET_NAME,
-        Key: fileKey,
-        Body: fileStream,
-        ContentType: 'video/mp4' // Assuming mp4 download
-    });
-
-    await s3Client.send(uploadCommand);
-    console.log(`[Job ${jobId}] S3 upload successful.`);
-
-    // --- Cleanup yt-dlp download ---
+  // 4. Perform Tasks in Background
+  (async () => {
     try {
-        await fsPromises.unlink(tempVideoPath);
-        console.log(`[Job ${jobId}] Cleaned up temporary yt-dlp download: ${tempVideoPath}`);
-    } catch (cleanupErr) {
-        console.warn(`[Job ${jobId}] Failed to cleanup yt-dlp download ${tempVideoPath}:`, cleanupErr);
+      // --- Download using yt-dlp ---
+      const tempDir = path.join(__dirname, '..', 'temp');
+      await fsPromises.mkdir(tempDir, { recursive: true });
+      const uniqueDownloadFilename = `${jobId}-youtube-download.mp4`;
+      tempVideoPath = path.join(tempDir, uniqueDownloadFilename);
+
+      console.log(`[Job ${jobId}] Starting yt-dlp download to: ${tempVideoPath}`);
+      const ytdlpProcess = spawn('yt-dlp', [
+        '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        '-o', tempVideoPath,
+        '--', youtubeUrl
+      ]);
+
+      let ytdlpError = '';
+      ytdlpProcess.stderr.on('data', (data) => {
+        console.log(`[Job ${jobId}] yt-dlp stderr: ${data.toString().trim()}`);
+        ytdlpError += data.toString();
+      });
+      ytdlpProcess.stdout.on('data', (data) => {
+        console.log(`[Job ${jobId}] yt-dlp stdout: ${data.toString().trim()}`);
+      });
+
+      const downloadExitCode = await new Promise((resolve, reject) => {
+        ytdlpProcess.on('close', resolve);
+        ytdlpProcess.on('error', reject); // Handle spawn errors
+      });
+
+      if (downloadExitCode !== 0) {
+        throw new Error(`yt-dlp failed with code ${downloadExitCode}. Error: ${ytdlpError}`);
+      }
+      console.log(`[Job ${jobId}] yt-dlp download successful.`);
+
+      // --- Update Status: Uploading ---
+      jobStore.set(jobId, { ...jobStore.get(jobId), status: 'uploading_s3' });
+      console.log(`[Job ${jobId}] Status: uploading_s3`);
+
+      // --- Upload to S3 ---
+      fileKey = `uploads/youtube-${jobId}-${path.basename(tempVideoPath)}`;
+      console.log(`[Job ${jobId}] Uploading ${tempVideoPath} to S3 with key: ${fileKey}`);
+
+      const fileStream = fs.createReadStream(tempVideoPath);
+      const uploadCommand = new PutObjectCommand({
+          Bucket: process.env.AWS_BUCKET_NAME,
+          Key: fileKey,
+          Body: fileStream,
+          ContentType: 'video/mp4'
+      });
+
+      await s3Client.send(uploadCommand);
+      console.log(`[Job ${jobId}] S3 upload successful.`);
+
+      // --- Cleanup yt-dlp download (after successful upload) ---
+      try {
+          await fsPromises.unlink(tempVideoPath);
+          console.log(`[Job ${jobId}] Cleaned up temporary yt-dlp download: ${tempVideoPath}`);
+          tempVideoPath = null; // Clear path after deletion
+      } catch (cleanupErr) {
+          console.warn(`[Job ${jobId}] Failed to cleanup yt-dlp download ${tempVideoPath}:`, cleanupErr);
+      }
+
+      // --- Acquire Lock (using S3 fileKey) ---
+      // Check lock *after* successful S3 upload
+      if (processingFiles.has(fileKey)) {
+        // This is unlikely now with unique job IDs in fileKey, but good practice
+        console.warn(`[Job ${jobId}] Lock for S3 key ${fileKey} already held. Waiting might occur.`);
+        // We proceed, startBackgroundProcessing will handle the lock internally
+      }
+      processingFiles.add(fileKey);
+      console.log(`[Job ${jobId}] Acquired lock for S3 key: ${fileKey}`);
+
+      // --- Update Status: Processing ---
+      jobStore.set(jobId, { ...jobStore.get(jobId), status: 'processing', fileKey: fileKey });
+      console.log(`[Job ${jobId}] Status: processing. FileKey: ${fileKey}`);
+
+      // --- Start Background Processing (Python script phase) ---
+      // This function handles the rest: S3 download for Python, spawn, status updates, cleanup, lock release
+      startBackgroundProcessing(jobId, fileKey);
+
+    } catch (error) {
+      // --- Handle Errors in Background Task ---
+      console.error(`[Job ${jobId}] Error during background YouTube processing:`, error);
+
+      // Update job store to 'error'
+      jobStore.set(jobId, {
+          ...(jobStore.get(jobId) || {}), // Keep existing info if possible
+          status: 'error',
+          message: `Failed during background processing: ${error.message}`,
+          details: error.stack,
+          endTime: Date.now(),
+          // Ensure these are present even if error happened early
+          source: 'youtube',
+          originalUrl: youtubeUrl
+      });
+      console.log(`[Job ${jobId}] Status: error`);
+
+      // Release lock if it was acquired
+      if (fileKey && processingFiles.has(fileKey)) {
+          processingFiles.delete(fileKey);
+          console.log(`[Job ${jobId}] Released lock for key: ${fileKey} due to error.`);
+      }
+
+      // Attempt to cleanup temp download file if it still exists
+      if (tempVideoPath) {
+          fsPromises.unlink(tempVideoPath).catch(cleanupErr => {
+              if (cleanupErr.code !== 'ENOENT') {
+                  console.warn(`[Job ${jobId}] Error cleaning up temp download ${tempVideoPath} after failure:`, cleanupErr);
+              }
+          });
+      }
     }
+  })(); // Immediately invoke the async background function
 
-    // --- Lock Check (using S3 fileKey) ---
-    // Check lock *after* successful S3 upload
-    if (processingFiles.has(fileKey)) {
-      console.log(`[Job ${jobId}] Processing already in progress for S3 key: ${fileKey}`);
-      // Note: This might happen if the exact same YT video was submitted concurrently.
-      // We still return 202 with the *new* jobId, but the background task might
-      // wait if the lock is held by another job for the *same fileKey*.
-      // Alternatively, could return 409 here, but letting it proceed might be okay.
-    }
-
-    // --- Acquire Lock (using S3 fileKey) ---
-    processingFiles.add(fileKey);
-    console.log(`[Job ${jobId}] Acquired lock for S3 key: ${fileKey}`);
-
-    // --- Store Initial Job State ---
-    jobStore.set(jobId, { status: 'processing', startTime: Date.now(), fileKey: fileKey, source: 'youtube', originalUrl: youtubeUrl });
-    console.log(`Job ${jobId} registered for fileKey: ${fileKey} (via YouTube URL)`);
-
-    // --- Return 202 Accepted ---
-    res.status(202).json({ jobId: jobId });
-
-    // --- Start Background Processing ---
-    // Use the same background function, passing the new jobId and the S3 fileKey
-    startBackgroundProcessing(jobId, fileKey); // No await here
-
-  } catch (error) {
-    console.error(`[Job ${jobId}] Error processing YouTube URL ${youtubeUrl}:`, error);
-
-    // Release lock if it was acquired before the error
-    if (fileKey && processingFiles.has(fileKey)) {
-        processingFiles.delete(fileKey);
-        console.log(`[Job ${jobId}] Released lock for key: ${fileKey} due to error.`);
-    }
-
-    // Attempt to cleanup temp download file if it exists and an error occurred
-    if (tempVideoPath) {
-        fsPromises.unlink(tempVideoPath).catch(cleanupErr => {
-            if (cleanupErr.code !== 'ENOENT') {
-                console.warn(`[Job ${jobId}] Error cleaning up temp download ${tempVideoPath} after failure:`, cleanupErr);
-            }
-        });
-    }
-
-    // Update job store if job was created
-     if (jobStore.has(jobId)) {
-        jobStore.set(jobId, {
-            status: 'error',
-            message: `Failed to process YouTube URL: ${error.message}`,
-            details: error.stack,
-            endTime: Date.now(),
-            source: 'youtube',
-            originalUrl: youtubeUrl
-        });
-     }
-
-    res.status(500).json({ error: 'Failed to process YouTube URL', details: error.message });
-  }
 });
 
 
