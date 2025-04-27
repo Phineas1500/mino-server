@@ -11,3 +11,4 @@ pyvenv.cfg
 src/uploadsbazinga
 src/__pycache__
 temp
+share

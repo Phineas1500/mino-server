@@ -160,15 +160,34 @@ async def process_batch_async(client, batch, batch_idx, total_batches):
         result = json.loads(response.choices[0].message.content)
         ratings = result.get('ratings', [])
         
+        # --- Added Logging ---
+        log(f"[Batch {batch_idx+1}] Received {len(ratings)} ratings for {len(batch)} segments.")
+        if len(ratings) != len(batch):
+             log(f"[Batch {batch_idx+1}] Warning: Rating count mismatch. Will adjust.", "WARNING")
+             # Adjust ratings array size if needed (existing logic)
+             if len(ratings) < len(batch):
+                 ratings.extend([
+                     {"score": 5, "speed": 1.7, "skip": False, "key_point": "Default (missing)"} 
+                     for _ in range(len(batch) - len(ratings))
+                 ])
+             else:
+                 ratings = ratings[:len(batch)]
+        # --- End Added Logging ---
+
         processed_segments = []
         batch_duration = 0
         batch_skippable = 0
         
-        for seg, rating in zip(batch, ratings[:len(batch)]):
+        for i, (seg, rating) in enumerate(zip(batch, ratings)): # Use enumerate for index
             try:
                 segment_duration = seg["end"] - seg["start"]
                 batch_duration += segment_duration
                 
+                # --- Added Logging ---
+                log(f"[Batch {batch_idx+1}, Seg {i+1}] Original Segment: start={seg['start']:.1f}, end={seg['end']:.1f}, text='{seg['text'][:50]}...'")
+                log(f"[Batch {batch_idx+1}, Seg {i+1}] Received Rating: {rating}")
+                # --- End Added Logging ---
+
                 importance_score = float(rating.get('score', 5))
                 importance_score = max(1, min(10, importance_score))
                 
@@ -199,34 +218,46 @@ async def process_batch_async(client, batch, batch_idx, total_batches):
                 if can_skip:
                     batch_skippable += segment_duration
                 
-                processed_segments.append({
+                processed_segment_data = {
                     "start": seg["start"],
                     "end": seg["end"],
-                    "text": seg["text"],
+                    "text": seg["text"], # Ensure text is always carried over
                     "can_skip": can_skip,
                     "importance_score": importance_score,
                     "playback_speed": playback_speed,
                     "original_duration": segment_duration,
                     "adjusted_duration": segment_duration / playback_speed,
                     "reason": rating.get('key_point', '')
-                })
+                }
+                processed_segments.append(processed_segment_data)
+
+                # --- Added Logging ---
+                log(f"[Batch {batch_idx+1}, Seg {i+1}] Processed Segment: score={importance_score}, speed={playback_speed}, skip={can_skip}, text='{processed_segment_data['text'][:50]}...'")
+                if importance_score <= 1:
+                     log(f"[Batch {batch_idx+1}, Seg {i+1}] Low score segment (<=1) processed. Text included: {'Yes' if processed_segment_data['text'] else 'No'}", "DEBUG")
+                # --- End Added Logging ---
                 
             except Exception as e:
-                log(f"Error processing segment: {str(e)}", "WARNING")
+                log(f"Error processing segment {i+1} in batch {batch_idx+1}: {str(e)}", "WARNING")
                 # Add default values for failed segments
                 segment_duration = seg["end"] - seg["start"]
-                processed_segments.append({
+                default_segment = {
                     "start": seg["start"],
                     "end": seg["end"],
-                    "text": seg["text"],
+                    "text": seg["text"], # Ensure text is included even in default
                     "can_skip": False,
                     "importance_score": 5,
                     "playback_speed": 1.5,
                     "original_duration": segment_duration,
                     "adjusted_duration": segment_duration / 1.5,
                     "reason": f"Error processing segment: {str(e)[:50]}"
-                })
+                }
+                processed_segments.append(default_segment)
+                log(f"[Batch {batch_idx+1}, Seg {i+1}] Added default segment due to error. Text included: {'Yes' if default_segment['text'] else 'No'}", "WARNING")
         
+        # --- Added Logging ---
+        log(f"[Batch {batch_idx+1}] Finished processing. Produced {len(processed_segments)} segments.")
+        # --- End Added Logging ---
         return {
             "segments": processed_segments,
             "total_duration": batch_duration,
@@ -235,6 +266,9 @@ async def process_batch_async(client, batch, batch_idx, total_batches):
         
     except Exception as e:
         log(f"Error in batch {batch_idx+1}: {str(e)}", "ERROR")
+        # --- Added Logging ---
+        log(f"[Batch {batch_idx+1}] Returning default segments due to batch error. Input count: {len(batch)}")
+        # --- End Added Logging ---
         return {
             "segments": [{
                 **seg,
@@ -243,7 +277,8 @@ async def process_batch_async(client, batch, batch_idx, total_batches):
                 "playback_speed": 1.5,
                 "original_duration": seg["end"] - seg["start"],
                 "adjusted_duration": (seg["end"] - seg["start"]) / 1.5,
-                "reason": f"Batch error: {str(e)[:50]}"
+                "reason": f"Batch error: {str(e)[:50]}",
+                "text": seg.get("text", "[Text missing due to batch error]") # Ensure text field exists
             } for seg in batch],
             "total_duration": sum(seg["end"] - seg["start"] for seg in batch),
             "skippable_duration": 0
@@ -288,15 +323,30 @@ async def process_segments_parallel(segments, client, batch_size=40, max_concurr
     total_duration = 0
     skippable_duration = 0
     
-    for result in batch_results:
+    # --- Added Logging ---
+    log(f"Aggregating results from {len(batch_results)} batches.")
+    # --- End Added Logging ---
+    for i, result in enumerate(batch_results):
         if isinstance(result, Exception):
-            log(f"Batch failed: {str(result)}", "ERROR")
+            log(f"Batch {i+1} failed: {str(result)}", "ERROR")
             continue
             
+        # --- Added Logging ---
+        log(f"Batch {i+1} result: {len(result.get('segments', []))} segments.")
+        # --- End Added Logging ---
         all_segments.extend(result["segments"])
         total_duration += result["total_duration"]
         skippable_duration += result["skippable_duration"]
     
+    # --- Added Logging ---
+    log(f"Aggregation complete. Total segments processed: {len(all_segments)}. Original input count: {len(segments)}")
+    if len(all_segments) != len(segments):
+         log(f"Warning: Segment count mismatch after aggregation! Input={len(segments)}, Output={len(all_segments)}", "WARNING")
+    if all_segments:
+        log(f"Sample - First processed segment text: '{all_segments[0].get('text', 'N/A')[:50]}...' score: {all_segments[0].get('importance_score', 'N/A')}")
+        log(f"Sample - Last processed segment text: '{all_segments[-1].get('text', 'N/A')[:50]}...' score: {all_segments[-1].get('importance_score', 'N/A')}")
+    # --- End Added Logging ---
+
     # Calculate statistics
     total_adjusted_duration = sum(seg["adjusted_duration"] for seg in all_segments)
     skippable_segments = [s for s in all_segments if s["can_skip"]]
@@ -646,6 +696,13 @@ async def process_audio(audio_data: bytes, filename: str):
             segments = result.get("segments", [])
             
             log(f"Transcription complete: {len(transcript)} characters, {len(segments)} segments")
+            
+            # --- Added Logging ---
+            log(f"Whisper produced {len(segments)} segments.")
+            if segments:
+                 log(f"Sample - First Whisper segment text: '{segments[0].get('text', 'N/A')[:50]}...'")
+                 log(f"Sample - Last Whisper segment text: '{segments[-1].get('text', 'N/A')[:50]}...'")
+            # --- End Added Logging ---
 
             # Process with OpenAI for summary, key points, and flashcards
             log("Generating educational content...")
@@ -730,6 +787,13 @@ async def process_audio(audio_data: bytes, filename: str):
                 batch_size=20,
                 max_concurrent=3
             )
+
+            # --- Added Logging ---
+            log(f"Parallel processing returned {len(analyzed_segments)} segments.")
+            if analyzed_segments:
+                 log(f"Sample - First analyzed segment text: '{analyzed_segments[0].get('text', 'N/A')[:50]}...' score: {analyzed_segments[0].get('importance_score', 'N/A')}")
+                 log(f"Sample - Last analyzed segment text: '{analyzed_segments[-1].get('text', 'N/A')[:50]}...' score: {analyzed_segments[-1].get('importance_score', 'N/A')}")
+            # --- End Added Logging ---
 
             # Return the final result
             return {
@@ -848,6 +912,13 @@ async def process_video(video_data: bytes, filename: str):
             segments = result.get("segments", [])
             
             log(f"Transcription complete: {len(transcript)} characters, {len(segments)} segments")
+            
+            # --- Added Logging ---
+            log(f"Whisper produced {len(segments)} segments.")
+            if segments:
+                 log(f"Sample - First Whisper segment text: '{segments[0].get('text', 'N/A')[:50]}...'")
+                 log(f"Sample - Last Whisper segment text: '{segments[-1].get('text', 'N/A')[:50]}...'")
+            # --- End Added Logging ---
 
             # Clean up audio file early
             if temp_audio_path.exists():
@@ -937,6 +1008,13 @@ async def process_video(video_data: bytes, filename: str):
                 batch_size=20,      # Number of segments per batch
                 max_concurrent=3    # Maximum number of concurrent API calls
             )
+
+            # --- Added Logging ---
+            log(f"Parallel processing returned {len(analyzed_segments)} segments.")
+            if analyzed_segments:
+                 log(f"Sample - First analyzed segment text: '{analyzed_segments[0].get('text', 'N/A')[:50]}...' score: {analyzed_segments[0].get('importance_score', 'N/A')}")
+                 log(f"Sample - Last analyzed segment text: '{analyzed_segments[-1].get('text', 'N/A')[:50]}...' score: {analyzed_segments[-1].get('importance_score', 'N/A')}")
+            # --- End Added Logging ---
 
             # Return the final result with educational content and analyzed segments
             return {
