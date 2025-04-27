@@ -1,3 +1,4 @@
+require('dotenv').config();
 module.exports = {
   apps: [{
     name: 'mino-server',
@@ -31,7 +32,7 @@ module.exports = {
     },
     env: {
       NODE_ENV: 'production',
-      PORT: 3001
+      PORT: process.env.PORT
     }
   }]
 }

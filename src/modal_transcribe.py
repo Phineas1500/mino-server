@@ -332,8 +332,8 @@ def log(message: str, level: str = "INFO") -> None:
 
 # Define the container image with all necessary dependencies
 image = (
-    Image.debian_slim(python_version="3.11")
-    .apt_install(
+        Image.from_registry("ubuntu:24.04", add_python="3.11", force_build=True)
+.apt_install(
         "ffmpeg",
         "git",
         "python3-pip",
@@ -341,7 +341,7 @@ image = (
         "python3-dev",
         "libsndfile1",
         "libglib2.0-0",
-        "libgl1-mesa-glx",
+        #"libgl1-mesa-glx",
         "libsm6",
         "libxext6"
     )
