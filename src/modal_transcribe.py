@@ -91,7 +91,7 @@ def analyze_segments_importance(segments, client, summary_data=None):
     analyzed_segments, _ = loop.run_until_complete(process_segments_parallel(segments, client))
     return analyzed_segments
 
-async def process_batch_async(client, batch, batch_idx, total_batches):
+async def process_batch_async(client, batch, batch_idx, total_batches, key_points): # Add key_points parameter
     """Process a batch of segments asynchronously with OpenAI API"""
     try:
         batch_texts = [
@@ -99,27 +99,31 @@ async def process_batch_async(client, batch, batch_idx, total_batches):
             for i, seg in enumerate(batch)
         ]
         log(f"Processing batch {batch_idx+1}/{total_batches} with {len(batch)} segments")
-        
-        segments_text = "\n\n".join(batch_texts)
-        
-        importance_prompt = f"""Rate these lecture segments and return the analysis in JSON format.
 
-        RATING RULES:
-        - 10-8: Essential content (core concepts, definitions, key principles) → 1.0x speed
-        - 7-5: Supporting content (examples, explanations, context) → 1.5x speed
-        - 4-1: Supplementary content (repetition, tangents, filler) → 2.0-2.5x speed
+        segments_text = "\n\n".join(batch_texts)
+        key_points_text = "\n".join([f"- {kp}" for kp in key_points]) # Format key points
+
+        importance_prompt = f"""Analyze these lecture segments based on their importance relative to the overall key points of the lecture. Return the analysis in JSON format.
+
+        OVERALL KEY POINTS:
+        {key_points_text}
+
+        RATING RULES (Consider relevance to the Key Points above):
+        - 10-8: Essential content (core concepts, definitions, key principles directly related to Key Points) → 1.0x speed
+        - 7-5: Supporting content (examples, explanations, context for Key Points) → 1.5x speed
+        - 4-1: Supplementary content (repetition, tangents, filler, loosely related info) → 2.0-2.5x speed
 
         PLAYBACK SPEED MUST follow this strict formula:
-        - For score 10: Use speed 1.0
-        - For score 9: Use speed 1.0
-        - For score 8: Use speed 1.1
-        - For score 7: Use speed 1.3
-        - For score 6: Use speed 1.5
-        - For score 5: Use speed 1.7
-        - For score 4: Use speed 1.9
-        - For score 3: Use speed 2.1
-        - For score 2: Use speed 2.3
-        - For score 1: Use speed 2.5
+        - Score 10: Speed 1.0
+        - Score 9: Speed 1.0
+        - Score 8: Speed 1.1
+        - Score 7: Speed 1.3
+        - Score 6: Speed 1.5
+        - Score 5: Speed 1.7
+        - Score 4: Speed 1.9
+        - Score 3: Speed 2.1
+        - Score 2: Speed 2.3
+        - Score 1: Speed 2.5
 
         SEGMENTS TO ANALYZE:
         {segments_text}
@@ -128,17 +132,17 @@ async def process_batch_async(client, batch, batch_idx, total_batches):
         {{
             "ratings": [
                 {{
-                    "score": number,          // 1-10 rating
-                    "speed": number,          // MUST follow the formula above
+                    "score": number,          // 1-10 rating based on importance and relevance to Key Points
+                    "speed": number,          // MUST follow the formula above based on score
                     "skip": boolean,          // true if score ≤ 3
-                    "key_point": "string"     // Brief summary
+                    "key_point": "string"     // Brief summary of the segment's content
                 }}
             ]
         }}"""
 
         def execute_openai_call():
             return client.chat.completions.create(
-                model="gpt-3.5-turbo",
+                model="gpt-4.1-nano-2025-04-14",
                 messages=[{
                     "role": "system",
                     "content": "You analyze educational content and return ratings in JSON format. Follow the playback speed formula precisely based on the score. Always respond with valid JSON matching the requested structure."
@@ -167,7 +171,7 @@ async def process_batch_async(client, batch, batch_idx, total_batches):
              # Adjust ratings array size if needed (existing logic)
              if len(ratings) < len(batch):
                  ratings.extend([
-                     {"score": 5, "speed": 1.7, "skip": False, "key_point": "Default (missing)"} 
+                     {"score": 5, "speed": 1.7, "skip": False, "key_point": ""} 
                      for _ in range(len(batch) - len(ratings))
                  ])
              else:
@@ -284,9 +288,9 @@ async def process_batch_async(client, batch, batch_idx, total_batches):
             "skippable_duration": 0
         }
         
-async def process_segments_parallel(segments, client, batch_size=40, max_concurrent=3):
+async def process_segments_parallel(segments, client, key_points, batch_size=40, max_concurrent=3): # Add key_points parameter
     """Process segments in parallel with controlled concurrency"""
-    log(f"Starting parallel processing of {len(segments)} segments")
+    log(f"Starting parallel processing of {len(segments)} segments with key points context.")
     
     # We're reverting to the original approach that doesn't merge segments
     # This will keep the original whisper transcript segments as is
@@ -312,7 +316,7 @@ async def process_segments_parallel(segments, client, batch_size=40, max_concurr
             if idx > 0:
                 delay = min(0.2 * (2 ** (idx // 3)), 2.0)  # Cap at 2 seconds
                 await asyncio.sleep(delay)
-            return await process_batch_async(client, batch, idx, len(batches))
+            return await process_batch_async(client, batch, idx, len(batches), key_points)
     
     # Process batches
     tasks = [process_with_semaphore(batch, i) for i, batch in enumerate(batches)]
@@ -459,7 +463,7 @@ async def optimize_playback_speed(segments):
                 # Run OpenAI call in a thread pool
                 def execute_openai_call():
                     return client.chat.completions.create(
-                        model="gpt-3.5-turbo",
+                        model="gpt-4.1-nano-2025-04-14",
                         messages=[
                             {
                                 "role": "system",
@@ -738,7 +742,7 @@ async def process_audio(audio_data: bytes, filename: str):
 
             log("Generating educational content with OpenAI...")
             content_response = client.chat.completions.create(
-                model="gpt-3.5-turbo",
+                model="gpt-4.1-nano-2025-04-14",
                 messages=[
                     {
                         "role": "system",
@@ -778,12 +782,14 @@ async def process_audio(audio_data: bytes, filename: str):
                 }
                 
             log("Successfully generated educational content")
+            key_points_list = content_data.get("keyPoints", []) # Get the key points
 
             # Process segments using parallel processing
             log("Analyzing segments using parallel processing...")
             analyzed_segments, stats = await process_segments_parallel(
                 segments, 
                 client,
+                key_points_list, # Pass the extracted key points
                 batch_size=20,
                 max_concurrent=3
             )
@@ -959,7 +965,7 @@ async def process_video(video_data: bytes, filename: str):
 
             log("Generating educational content with OpenAI...")
             content_response = client.chat.completions.create(
-                model="gpt-3.5-turbo",
+                model="gpt-4.1-nano-2025-04-14",
                 messages=[
                     {
                         "role": "system",
@@ -999,12 +1005,14 @@ async def process_video(video_data: bytes, filename: str):
                 }
                 
             log("Successfully generated educational content")
+            key_points_list = content_data.get("keyPoints", []) # Get the key points
 
             # Process segments using parallel processing
             log("Analyzing segments using parallel processing...")
             analyzed_segments, stats = await process_segments_parallel(
                 segments, 
                 client,
+                key_points_list, # Pass the extracted key points
                 batch_size=20,      # Number of segments per batch
                 max_concurrent=3    # Maximum number of concurrent API calls
             )

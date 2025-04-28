@@ -396,7 +396,7 @@ app.post('/process/youtube-url', async (req, res) => {
 
       console.log(`[Job ${jobId}] Starting yt-dlp download to: ${tempVideoPath}`);
       const ytdlpProcess = spawn('yt-dlp', [
-        '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        '-f', 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]', // Request max 720p MP4
         '-o', tempVideoPath,
         '--', youtubeUrl
       ]);
