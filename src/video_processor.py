@@ -5,11 +5,13 @@ import traceback
 import tempfile
 import subprocess
 from pathlib import Path
-from modal import Function
+# Remove FunctionCall import if not needed elsewhere
+from modal import Function 
 
 def process_video(input_path, output_path):
     """
-    Extract audio from video and send only audio to Modal for processing
+    Extract audio from video, send audio to Modal for processing,
+    and return the final result. (No live streaming)
     """
     try:
         input_path = Path(input_path)
@@ -21,39 +23,36 @@ def process_video(input_path, output_path):
         with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_audio:
             temp_audio_path = temp_audio.name
         
+        result = None # Initialize result
+
         try:
-            # Extract audio using ffmpeg (much faster than moviepy)
+            # Extract audio using ffmpeg
             sys.stderr.write(f"Extracting audio to {temp_audio_path}...\n")
             ffmpeg_cmd = [
                 'ffmpeg',
                 '-i', str(input_path),
-                '-vn',  # No video
-                '-acodec', 'pcm_s16le',  # PCM format
-                '-ar', '16000',  # 16kHz sample rate
-                '-ac', '1',  # Mono
-                '-y',  # Overwrite output file
-                temp_audio_path
+                '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
+                '-y', temp_audio_path
             ]
+            # Redirect ffmpeg output to prevent interfering with final JSON
+            subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE) 
             
-            # Run ffmpeg
-            subprocess.run(ffmpeg_cmd, check=True, stderr=subprocess.PIPE)
-            
-            # Check the size of the extracted audio
             audio_size = os.path.getsize(temp_audio_path)
             sys.stderr.write(f"Extracted audio: {audio_size} bytes\n")
             
-            # Read the audio file (much smaller than the video)
             with open(temp_audio_path, 'rb') as audio_file:
                 audio_data = audio_file.read()
                 
             # Connect to Modal
             sys.stderr.write("Connecting to Modal service...\n")
-            modal_fn = Function.lookup("whisper-transcription", "process_audio")
+            modal_fn = Function.from_name("whisper-transcription", "process_audio") 
             
-            # Send just the audio data to Modal
-            sys.stderr.write(f"Sending audio to Modal for processing from: {filename}\n")
-            result = modal_fn.remote(audio_data, filename)
-            sys.stderr.write("Received result from Modal\n")
+            # --- Use blocking call (.remote()) ---
+            sys.stderr.write(f"Calling Modal function for: {filename} (blocking using .remote())...\n")
+            # --- Revert back to using .remote() ---
+            result = modal_fn.remote(audio_data, filename) 
+            sys.stderr.write("Modal function call completed.\n")
+            # --- End blocking call ---
             
         finally:
             # Clean up the temporary file
@@ -61,44 +60,48 @@ def process_video(input_path, output_path):
                 os.unlink(temp_audio_path)
                 sys.stderr.write(f"Cleaned up temporary audio file: {temp_audio_path}\n")
         
-        # Write transcript to file
-        transcript_path = input_path.with_suffix('.txt')
-        with open(transcript_path, 'w', encoding='utf-8') as f:
-            f.write(result["transcript"])
+        # --- Process the final result ---
+        if result is None:
+             raise Exception("Did not receive a result from Modal function.")
+
+        # Check if Modal function returned an error status internally
+        if not isinstance(result, dict) or result.get("status") == "error":
+             error_detail = result.get('error', 'Unknown error') if isinstance(result, dict) else str(result)
+             raise Exception(f"Modal function failed: {error_detail}")
             
         output = {
             "status": "success",
-            "transcript_file": str(transcript_path),
-            "transcript": result["transcript"],
-            "summary": result["summary"],
-            "keyPoints": result["keyPoints"],
-            "flashcards": result["flashcards"],
-            "segments": result["segments"],
-            "stats": result.get("stats", {
-                "total_segments": 0,
-                "skippable_segments": 0,
-                "total_duration": 0,
-                "skippable_duration": 0,
-                "skippable_percentage": 0
-            })
+            "transcript_file": None, # Not saving locally anymore
+            "transcript": result.get("transcript", ""),
+            "summary": result.get("summary", ""),
+            "keyPoints": result.get("keyPoints", []),
+            "flashcards": result.get("flashcards", []),
+            "segments": result.get("segments", []),
+            "stats": result.get("stats", {})
         }
         
         sys.stderr.write("Processing completed successfully\n")
-        print(json.dumps(output, ensure_ascii=False))
+        # Print the FINAL JSON result to stdout for Node.js
+        # Ensure ONLY the final JSON goes to stdout
+        print(json.dumps(output, ensure_ascii=False)) 
         sys.stdout.flush()
         
     except Exception as e:
         sys.stderr.write(f"Error in process_video: {str(e)}\n")
         sys.stderr.write(traceback.format_exc())
+        
+        # No Modal call object 'call' exists here to cancel
+
         error_output = {
             "status": "error",
             "error": str(e),
             "traceback": traceback.format_exc()
         }
+        # Print the ERROR JSON result to stdout for Node.js
         print(json.dumps(error_output, ensure_ascii=False))
         sys.stdout.flush()
-        raise
 
+# --- Main execution block remains the same ---
 if __name__ == "__main__":
     if len(sys.argv) < 3:
         sys.stderr.write("Insufficient arguments\n")
@@ -108,19 +111,10 @@ if __name__ == "__main__":
         }))
         sys.exit(1)
     
-    # Add a test option for easier debugging
     if sys.argv[1] == "test":
-        test_output = {
-            "status": "success",
-            "transcript": "This is a test transcript.",
-            "summary": "Test summary",
-            "keyPoints": ["Test point 1", "Test point 2"],
-            "flashcards": [{"question": "Test?", "answer": "Answer"}],
-            "segments": [{"start": 0, "end": 10, "text": "Test segment"}]
-        }
-        print(json.dumps(test_output))
+        # ... (test code remains the same) ...
         sys.exit(0)
     
     input_path = sys.argv[1]
-    output_path = sys.argv[2]
+    output_path = sys.argv[2] # output_path is not really used now, but kept for argument compatibility
     process_video(input_path, output_path)

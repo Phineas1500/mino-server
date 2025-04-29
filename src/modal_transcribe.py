@@ -14,6 +14,16 @@ import soundfile as sf
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import time
+import sys # Import sys for flushing output
+
+# --- 1. Define Progress Reporting Function ---
+def report_progress(percentage: int, stage: str, message: str = None):
+    """Prints progress updates to stdout for the calling process."""
+    log_msg = f"PROGRESS: {percentage} STAGE: {stage}"
+    if message:
+        log_msg += f" MESSAGE: {message}"
+    print(log_msg, flush=True) # Use flush=True
+    sys.stdout.flush() # Explicit flush
 
 def fix_overlapping_segments(segments):
     """Fix any overlapping segments by adjusting end times"""
@@ -288,10 +298,11 @@ async def process_batch_async(client, batch, batch_idx, total_batches, key_point
             "skippable_duration": 0
         }
         
-async def process_segments_parallel(segments, client, key_points, batch_size=40, max_concurrent=3): # Add key_points parameter
-    """Process segments in parallel with controlled concurrency"""
+async def process_segments_parallel(segments, client, key_points, batch_size=40, max_concurrent=3, base_progress=80, progress_range=14): # Add progress params
+    """Process segments in parallel with controlled concurrency and progress reporting"""
     log(f"Starting parallel processing of {len(segments)} segments with key points context.")
-    
+    report_progress(base_progress, "analyzing", f"Starting segment analysis...") # Initial progress for this step
+
     # We're reverting to the original approach that doesn't merge segments
     # This will keep the original whisper transcript segments as is
     merged_segments = segments.copy()
@@ -306,22 +317,28 @@ async def process_segments_parallel(segments, client, key_points, batch_size=40,
     # Adjust batch size based on segment count
     dynamic_batch_size = min(max(10, merged_count // 4), batch_size)
     batches = [merged_segments[i:i+dynamic_batch_size] for i in range(0, len(merged_segments), dynamic_batch_size)]
-    
-    # Create a semaphore to limit concurrency
+    total_batches = len(batches)
+
     semaphore = asyncio.Semaphore(max_concurrent)
-    
+    processed_batches_count = 0 # Counter for progress
+
     async def process_with_semaphore(batch, idx):
+        nonlocal processed_batches_count
         async with semaphore:
-            # Add exponential backoff between batches to prevent rate limiting
             if idx > 0:
-                delay = min(0.2 * (2 ** (idx // 3)), 2.0)  # Cap at 2 seconds
+                delay = min(0.2 * (2 ** (idx // 3)), 2.0)
                 await asyncio.sleep(delay)
-            return await process_batch_async(client, batch, idx, len(batches), key_points)
-    
-    # Process batches
+            result = await process_batch_async(client, batch, idx, total_batches, key_points)
+            # --- Report progress after each batch ---
+            processed_batches_count += 1
+            current_progress = base_progress + int((processed_batches_count / total_batches) * progress_range)
+            report_progress(current_progress, "analyzing", f"Analyzed batch {idx+1}/{total_batches}")
+            # --- End progress reporting ---
+            return result
+
     tasks = [process_with_semaphore(batch, i) for i, batch in enumerate(batches)]
     batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-    
+
     # Combine results
     all_segments = []
     total_duration = 0
@@ -367,6 +384,8 @@ async def process_segments_parallel(segments, client, key_points, batch_size=40,
     else:
         log("Warning: No valid segments with duration found")
     
+    # Final progress update for this step (slightly before Node parsing)
+    report_progress(base_progress + progress_range, "analyzing", "Segment analysis complete.")
     return all_segments, {
         "total_segments": len(all_segments),
         "skippable_segments": len(skippable_segments),
@@ -382,7 +401,7 @@ app = App("whisper-transcription")
 
 def log(message: str, level: str = "INFO") -> None:
     """Helper function for consistent logging"""
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [{level}] {message}")
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [{level}] {message}", file=sys.stderr, flush=True) # Log to stderr
 
 # Define the container image with all necessary dependencies
 image = (
@@ -659,8 +678,18 @@ async def optimize_playback_speed(segments):
 )
 async def process_audio(audio_data: bytes, filename: str):
     """Process just the audio track for faster upload and processing"""
-    temp_files = []  # Keep track of temporary files
+    temp_files = []
+    # --- Define Progress Mapping for Audio ---
+    # Assuming audio processing maps to 40%-94% overall progress
+    PROGRESS_START = 40
+    PROGRESS_LOAD_MODEL_END = 42
+    PROGRESS_TRANSCRIBE_END = 75
+    PROGRESS_CONTENT_GEN_END = 80
+    PROGRESS_SEGMENT_ANALYSIS_START = 80
+    PROGRESS_SEGMENT_ANALYSIS_END = 94
+    # --- End Progress Mapping ---
     try:
+        report_progress(PROGRESS_START, "preparing", "Starting audio processing")
         # Create a safe filename without spaces
         safe_filename = filename.replace(" ", "_")
         
@@ -682,17 +711,21 @@ async def process_audio(audio_data: bytes, filename: str):
             if audio_size == 0:
                 raise ValueError("Audio file is empty")
 
-            # Transcribe with Whisper - using tiny model for speed
+            # --- Transcribe with Whisper ---
+            report_progress(PROGRESS_START, "loading_model", "Loading transcription model...")
             log("Loading Whisper model...")
             model = whisper.load_model("tiny")
-            
+            report_progress(PROGRESS_LOAD_MODEL_END, "loading_model", "Transcription model loaded.")
+
+            report_progress(PROGRESS_LOAD_MODEL_END, "transcribing", "Starting transcription...")
             log("Starting transcription...")
             result = model.transcribe(
                 str(temp_audio_path),
                 language='en',
-                verbose=True
+                verbose=True # Keep verbose for Whisper's own logs (to stderr)
             )
-            
+            report_progress(PROGRESS_TRANSCRIBE_END, "transcribing", "Transcription complete.")
+
             if not result or not isinstance(result, dict):
                 raise ValueError(f"Invalid Whisper result: {result}")
                 
@@ -708,7 +741,8 @@ async def process_audio(audio_data: bytes, filename: str):
                  log(f"Sample - Last Whisper segment text: '{segments[-1].get('text', 'N/A')[:50]}...'")
             # --- End Added Logging ---
 
-            # Process with OpenAI for summary, key points, and flashcards
+            # --- Process with OpenAI ---
+            report_progress(PROGRESS_TRANSCRIBE_END, "generating_summary", "Generating summary...")
             log("Generating educational content...")
             client = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
@@ -783,16 +817,21 @@ async def process_audio(audio_data: bytes, filename: str):
                 
             log("Successfully generated educational content")
             key_points_list = content_data.get("keyPoints", []) # Get the key points
+            report_progress(PROGRESS_CONTENT_GEN_END, "generating_keypoints", "Generated summary and key points.") # Update stage
 
-            # Process segments using parallel processing
+            # --- Process segments ---
+            # Pass progress parameters to the parallel function
             log("Analyzing segments using parallel processing...")
             analyzed_segments, stats = await process_segments_parallel(
                 segments, 
                 client,
                 key_points_list, # Pass the extracted key points
                 batch_size=20,
-                max_concurrent=3
+                max_concurrent=3,
+                base_progress=PROGRESS_SEGMENT_ANALYSIS_START,
+                progress_range=(PROGRESS_SEGMENT_ANALYSIS_END - PROGRESS_SEGMENT_ANALYSIS_START)
             )
+            # report_progress is called inside process_segments_parallel
 
             # --- Added Logging ---
             log(f"Parallel processing returned {len(analyzed_segments)} segments.")
@@ -801,7 +840,8 @@ async def process_audio(audio_data: bytes, filename: str):
                  log(f"Sample - Last analyzed segment text: '{analyzed_segments[-1].get('text', 'N/A')[:50]}...' score: {analyzed_segments[-1].get('importance_score', 'N/A')}")
             # --- End Added Logging ---
 
-            # Return the final result
+            # --- Return final result ---
+            # Node.js will report 95% (parsing_results) after receiving this JSON
             return {
                 "status": "success",
                 "summary": content_data["summary"],
@@ -854,8 +894,20 @@ async def process_audio(audio_data: bytes, filename: str):
 )
 async def process_video(video_data: bytes, filename: str):
     """Main function that handles video processing, transcription, and content analysis"""
-    temp_files = []  # Keep track of temporary files
+    temp_files = []
+    # --- Define Progress Mapping for Video ---
+    # Assuming video processing maps to 35%-94% overall progress
+    PROGRESS_START = 35
+    PROGRESS_EXTRACT_AUDIO_START = 36
+    PROGRESS_EXTRACT_AUDIO_END = 40
+    PROGRESS_LOAD_MODEL_END = 42
+    PROGRESS_TRANSCRIBE_END = 75
+    PROGRESS_CONTENT_GEN_END = 80
+    PROGRESS_SEGMENT_ANALYSIS_START = 80
+    PROGRESS_SEGMENT_ANALYSIS_END = 94
+    # --- End Progress Mapping ---
     try:
+        report_progress(PROGRESS_START, "preparing_script", "Starting video processing")
         # Create a safe filename without spaces
         safe_filename = filename.replace(" ", "_")
         
@@ -869,7 +921,8 @@ async def process_video(video_data: bytes, filename: str):
         temp_video_path.parent.mkdir(parents=True, exist_ok=True)
 
         try:
-            # Extract audio for transcription using ffmpeg directly instead of moviepy
+            # --- Extract audio ---
+            report_progress(PROGRESS_EXTRACT_AUDIO_START, "extracting_audio", "Extracting audio...")
             log("Extracting audio for transcription using ffmpeg...")
             temp_audio_path = temp_video_path.with_suffix('.wav')
             temp_files.append(temp_audio_path)  # Track for cleanup
@@ -889,6 +942,7 @@ async def process_video(video_data: bytes, filename: str):
             # Run ffmpeg
             import subprocess
             subprocess.run(ffmpeg_cmd, check=True, stderr=subprocess.PIPE)
+            report_progress(PROGRESS_EXTRACT_AUDIO_END, "extracting_audio", "Audio extraction complete.")
             
             log(f"Audio extraction complete to {temp_audio_path}")
 
@@ -900,17 +954,21 @@ async def process_video(video_data: bytes, filename: str):
             if audio_size == 0:
                 raise ValueError("Audio file is empty")
 
-            # Transcribe with Whisper using tiny model
+            # --- Transcribe with Whisper ---
+            report_progress(PROGRESS_EXTRACT_AUDIO_END, "loading_model", "Loading transcription model...")
             log("Loading Whisper model...")
             model = whisper.load_model("tiny")
-            
+            report_progress(PROGRESS_LOAD_MODEL_END, "loading_model", "Transcription model loaded.")
+
+            report_progress(PROGRESS_LOAD_MODEL_END, "transcribing", "Starting transcription...")
             log("Starting transcription...")
             result = model.transcribe(
                 str(temp_audio_path),
                 language='en',
-                verbose=True
+                verbose=True # Keep verbose for Whisper's own logs (to stderr)
             )
-            
+            report_progress(PROGRESS_TRANSCRIBE_END, "transcribing", "Transcription complete.")
+
             if not result or not isinstance(result, dict):
                 raise ValueError(f"Invalid Whisper result: {result}")
                 
@@ -931,7 +989,8 @@ async def process_video(video_data: bytes, filename: str):
                 temp_audio_path.unlink()
                 log("Cleaned up audio file")
 
-            # Process with OpenAI for summary, key points, and flashcards
+            # --- Process with OpenAI ---
+            report_progress(PROGRESS_TRANSCRIBE_END, "generating_summary", "Generating summary...")
             log("Generating educational content...")
             client = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
@@ -1006,16 +1065,21 @@ async def process_video(video_data: bytes, filename: str):
                 
             log("Successfully generated educational content")
             key_points_list = content_data.get("keyPoints", []) # Get the key points
+            report_progress(PROGRESS_CONTENT_GEN_END, "generating_keypoints", "Generated summary and key points.") # Update stage
 
-            # Process segments using parallel processing
+            # --- Process segments ---
+            # Pass progress parameters to the parallel function
             log("Analyzing segments using parallel processing...")
             analyzed_segments, stats = await process_segments_parallel(
                 segments, 
                 client,
                 key_points_list, # Pass the extracted key points
                 batch_size=20,      # Number of segments per batch
-                max_concurrent=3    # Maximum number of concurrent API calls
+                max_concurrent=3,    # Maximum number of concurrent API calls
+                base_progress=PROGRESS_SEGMENT_ANALYSIS_START,
+                progress_range=(PROGRESS_SEGMENT_ANALYSIS_END - PROGRESS_SEGMENT_ANALYSIS_START)
             )
+            # report_progress is called inside process_segments_parallel
 
             # --- Added Logging ---
             log(f"Parallel processing returned {len(analyzed_segments)} segments.")
@@ -1024,7 +1088,8 @@ async def process_video(video_data: bytes, filename: str):
                  log(f"Sample - Last analyzed segment text: '{analyzed_segments[-1].get('text', 'N/A')[:50]}...' score: {analyzed_segments[-1].get('importance_score', 'N/A')}")
             # --- End Added Logging ---
 
-            # Return the final result with educational content and analyzed segments
+            # --- Return final result ---
+            # Node.js will report 95% (parsing_results) after receiving this JSON
             return {
                 "status": "success",
                 "summary": content_data["summary"],
