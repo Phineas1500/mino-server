@@ -12,6 +12,13 @@ const { generatePresignedUrl, s3Client } = require('./services/s3');
 const { promises: fsPromises } = require('fs');
 const { v4: uuidv4 } = require('uuid'); // Import uuid for generating job IDs
 
+// --- Define job data directory ---
+const JOB_DATA_DIR = path.join(__dirname, '..', 'jobdata');
+
+// --- Ensure job data directory exists ---
+fsPromises.mkdir(JOB_DATA_DIR, { recursive: true })
+  .catch(err => console.error('Failed to create job data directory:', err));
+
 process.on('unhandledRejection', (reason, promise) => {
   console.error('Unhandled Rejection at:', promise, 'reason:', reason);
 });
@@ -30,8 +37,6 @@ console.log('AWS Config:', {
 const app = express();
 const PORT = process.env.PORT;
 
-// In-memory store for job statuses
-const jobStore = new Map();
 // Set to track currently processing S3 file keys
 const processingFiles = new Set();
 
@@ -73,27 +78,58 @@ function getPythonCommand() {
   return 'python3'; // fallback to system python
 }
 
+// --- Helper function to read job data ---
+async function readJobData(jobId) {
+  const filePath = path.join(JOB_DATA_DIR, `${jobId}.json`);
+  try {
+    const data = await fsPromises.readFile(filePath, 'utf8');
+    return JSON.parse(data);
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return null; // Job file not found
+    }
+    console.error(`[Job ${jobId}] Error reading job file:`, error);
+    throw error; // Re-throw other errors
+  }
+}
+
+// --- Helper function to write job data ---
+async function writeJobData(jobId, jobData) {
+  const filePath = path.join(JOB_DATA_DIR, `${jobId}.json`);
+  try {
+    await fsPromises.writeFile(filePath, JSON.stringify(jobData, null, 2), 'utf8');
+  } catch (error) {
+    console.error(`[Job ${jobId}] Error writing job file:`, error);
+    throw error;
+  }
+}
+
 // --- Refactored Background Processing Logic ---
 async function startBackgroundProcessing(jobId, fileKey) {
   let localPath; // Path for the file downloaded from S3 for processing
   let transcriptFilePath; // Path for the generated transcript file
 
-  // Helper to update job status consistently
-  const updateJobStatus = (stage, progress, message = null) => {
-    const currentJob = jobStore.get(jobId) || {};
-    jobStore.set(jobId, {
-      ...currentJob,
-      status: 'processing', // Keep status as 'processing' until final state
-      stage: stage,
-      progress: progress,
-      ...(message && { message: message }) // Add message if provided
-    });
-    console.log(`[Job ${jobId}] Status Update: Stage=${stage}, Progress=${progress}%`);
+  // Helper to update job status consistently (now writes to file)
+  const updateJobStatus = async (stage, progress, message = null) => {
+    try {
+      const currentJob = await readJobData(jobId) || {};
+      const updatedJob = {
+        ...currentJob,
+        status: 'processing', // Keep status as 'processing' until final state
+        stage: stage,
+        progress: progress,
+        ...(message && { message: message }) // Add message if provided
+      };
+      await writeJobData(jobId, updatedJob);
+      console.log(`[Job ${jobId}] Status Update (File): Stage=${stage}, Progress=${progress}%`);
+    } catch (error) {
+        console.error(`[Job ${jobId}] Failed to update job status file:`, error);
+    }
   };
 
   console.log(`[Job ${jobId}] Starting background processing for fileKey: ${fileKey}`);
-  // Initial stage for this function (assuming download is next)
-  updateJobStatus('downloading_from_s3', 25, 'Downloading video for processing...'); // Example: 25%
+  // Initial stage update (now async)
+  await updateJobStatus('downloading_from_s3', 25, 'Downloading video for processing...'); // Example: 25%
 
   // This function runs independently after the initial request returns 202
   try {
@@ -108,30 +144,77 @@ async function startBackgroundProcessing(jobId, fileKey) {
       Key: fileKey
     });
     console.log(`[Job ${jobId}] Fetching from S3 for processing:`, { bucket: process.env.AWS_BUCKET_NAME, key: fileKey });
-    const response = await s3Client.send(getCommand);
+    
+    let response; // Define response outside try block if needed later
+    try {
+        response = await s3Client.send(getCommand);
+    } catch (s3Error) {
+        console.error(`[Job ${jobId}] Failed to send S3 GetObject command:`, s3Error);
+        throw new Error(`Failed to initiate download from S3: ${s3Error.message}`); // Re-throw specific error
+    }
+
     const readStream = response.Body;
 
-    if (!readStream) {
-      throw new Error('Failed to get video stream from S3 for processing');
+    // --- Check if readStream is valid ---
+    if (!readStream || typeof readStream.pipe !== 'function') {
+      console.error(`[Job ${jobId}] Invalid or missing stream from S3 response. Body type: ${typeof readStream}`);
+      throw new Error('Failed to get a valid video stream from S3 for processing');
     }
+    console.log(`[Job ${jobId}] Received valid stream from S3.`);
+    // --- End Check ---
 
-    // --- Stream download with progress (more complex, simplified here) ---
-    // For actual progress, you'd need to track bytes downloaded vs total size if available
-    const writeStream = await fsPromises.open(localPath, 'w');
-    const chunks = [];
-    for await (const chunk of readStream) {
-      chunks.push(chunk);
-      // Simple progress update based on assumption (replace with real calculation if possible)
-      // updateJobStatus('downloading_from_s3', 28); // Small increments
-    }
-    await writeStream.write(Buffer.concat(chunks));
-    await writeStream.close();
+
+    // --- Stream download directly to file ---
+    console.log(`[Job ${jobId}] Starting stream download to ${localPath}...`);
+    const writeStream = fs.createWriteStream(localPath);
+
+    console.log(`[Job ${jobId}] Setting up pipe and event listeners...`); // Log before pipe
+    await new Promise((resolve, reject) => {
+        let readStreamError = null;
+        let writeStreamError = null;
+
+        readStream.on('error', (err) => {
+            console.error(`[Job ${jobId}] S3 read stream error:`, err);
+            readStreamError = err; // Store error
+            // Ensure write stream is destroyed to prevent leaks if read fails
+            if (!writeStream.destroyed) {
+                writeStream.destroy(err);
+            }
+            reject(err); // Reject the promise
+        });
+
+        writeStream.on('error', (err) => {
+            console.error(`[Job ${jobId}] File write stream error:`, err);
+            writeStreamError = err; // Store error
+            // No need to destroy readStream here, S3 SDK handles its cleanup
+            reject(err); // Reject the promise
+        });
+
+        writeStream.on('finish', () => {
+            // Only resolve if no errors occurred on either stream
+            if (!readStreamError && !writeStreamError) {
+                console.log(`[Job ${jobId}] File write stream finished successfully.`);
+                resolve();
+            } else {
+                console.log(`[Job ${jobId}] File write stream finished, but an error occurred earlier.`);
+                // Reject with the first error encountered if finish event still fires after error
+                reject(writeStreamError || readStreamError || new Error("Stream finished with pending errors"));
+            }
+        });
+        
+        // Initiate the pipe *after* listeners are attached
+        console.log(`[Job ${jobId}] Initiating pipe...`);
+        readStream.pipe(writeStream);
+    });
+    // writeStream is automatically closed on 'finish' or 'error' when using pipe
     console.log(`[Job ${jobId}] Downloaded file from S3 for processing to: ${localPath}`);
-    updateJobStatus('preparing_script', 30, 'Preparing analysis script...'); // Example: 30%
+    // --- End stream download ---
+
+    await updateJobStatus('preparing_script', 30, 'Preparing analysis script...'); // Example: 30%
 
     // --- Spawn Python Script ---
     const pythonCommand = getPythonCommand();
-    updateJobStatus('processing_video', 35, 'Starting video analysis...'); // Example: 35%
+    await updateJobStatus('processing_video', 35, 'Starting video analysis...'); // Example: 35%
     const pythonProcess = spawn(pythonCommand, [
       path.join(__dirname, 'video_processor.py'), // Ensure this path is correct
       localPath,
@@ -161,7 +244,7 @@ async function startBackgroundProcessing(jobId, fileKey) {
               const pyMessage = progressMatch[3] || `Processing stage: ${pyStage}`;
 
               const overallProgress = Math.max(35, Math.min(95, pyProgress)); // Clamp progress
-              updateJobStatus(pyStage, overallProgress, pyMessage);
+              updateJobStatus(pyStage, overallProgress, pyMessage); // Call async update
           } else {
                // Assume lines not matching PROGRESS are part of the final JSON or other logs
                // Append only non-progress lines intended for final JSON parsing
@@ -194,7 +277,7 @@ async function startBackgroundProcessing(jobId, fileKey) {
       // --- End processing remaining buffer ---
 
       console.log(`[Job ${jobId}] Python process closed with code: ${code}`);
-      updateJobStatus('parsing_results', 95, 'Parsing analysis results...'); // Example: 95%
+      await updateJobStatus('parsing_results', 95, 'Parsing analysis results...'); // Example: 95%
       let finalResult; // To store parsed result
 
       try {
@@ -222,7 +305,7 @@ async function startBackgroundProcessing(jobId, fileKey) {
         transcriptFilePath = finalResult?.transcript_file; // Store for cleanup
 
         if (finalResult.status === 'success') {
-          updateJobStatus('finalizing', 98, 'Finalizing results...'); // Example: 98%
+          await updateJobStatus('finalizing', 98, 'Finalizing results...'); // Example: 98%
           let transcriptContent = '';
           if (finalResult.transcript_file) {
             try {
@@ -236,11 +319,11 @@ async function startBackgroundProcessing(jobId, fileKey) {
              transcriptContent = finalResult.transcript || ''; // Fallback
           }
 
-          // Update job store on success
-          jobStore.set(jobId, {
+          // Update job store on success (now writes to file)
+          const successData = {
             status: 'complete',
-            stage: 'complete', // Final stage
-            progress: 100,     // Final progress
+            stage: 'complete',
+            progress: 100,
             data: {
               fileKey: fileKey,
               transcript: transcriptContent,
@@ -250,25 +333,32 @@ async function startBackgroundProcessing(jobId, fileKey) {
               flashcards: finalResult.flashcards,
               stats: finalResult.stats
             },
-            endTime: Date.now()
-          });
-          console.log(`[Job ${jobId}] Completed successfully.`);
+            endTime: Date.now(),
+            // --- Ensure source and originalUrl are preserved if they exist ---
+            ...(await readJobData(jobId) || {}).source && { source: (await readJobData(jobId)).source },
+            ...(await readJobData(jobId) || {}).originalUrl && { originalUrl: (await readJobData(jobId)).originalUrl },
+            // --- ---
+          };
+          await writeJobData(jobId, successData);
+          console.log(`[Job ${jobId}] Completed successfully (File).`);
 
         } else {
           throw new Error(finalResult.error || 'Processing failed in Python script');
         }
       } catch (error) {
         console.error(`[Job ${jobId}] Error during Python process close/parsing:`, error);
-        // Update job store on error
-        const currentProgress = jobStore.get(jobId)?.progress || 0; // Keep progress where it failed
-        jobStore.set(jobId, {
-          status: 'error',
-          stage: 'error', // Specific error stage
-          progress: currentProgress,
-          message: error.message || 'An unknown error occurred during processing.',
-          details: error.stack,
-          endTime: Date.now()
-        });
+        // Update job store on error (now writes to file)
+        const currentJob = await readJobData(jobId) || {};
+        const errorData = {
+            ...currentJob, // Preserve existing data like startTime, fileKey, source etc.
+            status: 'error',
+            stage: 'error',
+            progress: currentJob.progress || 0, // Keep progress where it failed
+            message: error.message || 'An unknown error occurred during processing.',
+            details: error.stack,
+            endTime: Date.now()
+        };
+        await writeJobData(jobId, errorData);
       } finally {
         // --- Release Lock ---
         if (processingFiles.has(fileKey)) {
@@ -311,16 +401,19 @@ async function startBackgroundProcessing(jobId, fileKey) {
     });
 
     // --- Handle Python Spawn Error ---
-    pythonProcess.on('error', (err) => {
+    pythonProcess.on('error', async (err) => { // Make handler async
       console.error(`[Job ${jobId}] Failed to start Python process:`, err);
-      jobStore.set(jobId, {
+      const currentJob = await readJobData(jobId) || {};
+      const spawnErrorData = {
+        ...currentJob,
         status: 'error',
         stage: 'error',
-        progress: jobStore.get(jobId)?.progress || 30, // Progress where it failed
+        progress: currentJob.progress || 30, // Progress where it failed
         message: 'Failed to start processing task.',
         details: err.message,
         endTime: Date.now()
-      });
+      };
+      await writeJobData(jobId, spawnErrorData);
       // Release lock if spawn fails
       if (processingFiles.has(fileKey)) {
         processingFiles.delete(fileKey);
@@ -333,15 +426,18 @@ async function startBackgroundProcessing(jobId, fileKey) {
     });
 
   } catch (error) { // Catch errors during the setup phase (e.g., S3 download)
-    console.error(`[Job ${jobId}] Error in background processing setup:`, error);
-    jobStore.set(jobId, {
-      status: 'error',
-      stage: 'error',
-      progress: jobStore.get(jobId)?.progress || 0, // Progress where it failed
-      message: error.message || 'Failed during setup before processing could start.',
-      details: error.stack,
-      endTime: Date.now()
-    });
+    console.error(`[Job ${jobId}] Error in background processing setup (including download):`, error); // Updated log message
+    const currentJob = await readJobData(jobId) || {}; // Read existing data if available
+    const setupErrorData = {
+        ...currentJob, // Preserve existing data
+        status: 'error',
+        stage: 'error',
+        progress: currentJob.progress || 0, // Progress where it failed
+        message: error.message || 'Failed during setup before processing could start.',
+        details: error.stack,
+        endTime: Date.now()
+    };
+    await writeJobData(jobId, setupErrorData); // Write error status to file
     // Release lock on setup error
     if (processingFiles.has(fileKey)) {
       processingFiles.delete(fileKey);
@@ -414,27 +510,36 @@ app.post('/process/s3-video', async (req, res) => {
   processingFiles.add(fileKey);
   console.log(`Acquired lock for key: ${fileKey}`);
 
-  // Generate Job ID and store initial state
+  // Generate Job ID and store initial state (now writes to file)
   const jobId = uuidv4();
-  // --- Set initial stage and progress ---
-  jobStore.set(jobId, {
-      status: 'processing', // Start as processing
-      stage: 'pending',     // Initial stage
-      progress: 5,          // Small initial progress
+  const initialJobData = {
+      status: 'processing',
+      stage: 'pending',
+      progress: 5,
       message: 'Processing request received...',
       startTime: Date.now(),
       fileKey: fileKey,
       source: 's3-upload'
-  });
-  // --- End initial state ---
-  console.log(`Job ${jobId} started for fileKey: ${fileKey} (via direct upload)`);
+  };
+  try {
+      await writeJobData(jobId, initialJobData); // Write initial state
+      console.log(`Job ${jobId} started (File) for fileKey: ${fileKey} (via direct upload)`);
 
-  // Immediately return 202 Accepted
-  res.status(202).json({ jobId: jobId });
+      // Immediately return 202 Accepted
+      res.status(202).json({ jobId: jobId });
 
-  // --- Start background processing using the refactored function ---
-  startBackgroundProcessing(jobId, fileKey); // No await here
+      // --- Start background processing ---
+      startBackgroundProcessing(jobId, fileKey); // No await here
 
+  } catch (error) {
+      console.error(`[Job ${jobId}] Failed to write initial job data:`, error);
+      // Release lock if initial write fails
+      if (processingFiles.has(fileKey)) {
+          processingFiles.delete(fileKey);
+          console.log(`[Job ${jobId}] Released lock for key: ${fileKey} (initial write error)`);
+      }
+      res.status(500).json({ error: 'Failed to initialize processing job.' });
+  }
 });
 
 // --- Modified YouTube URL Processing Endpoint (Fully Asynchronous) ---
@@ -455,167 +560,182 @@ app.post('/process/youtube-url', async (req, res) => {
   // 1. Generate Job ID early
   const jobId = uuidv4();
 
-  // Helper to update job status consistently within this scope
-  const updateYoutubeJobStatus = (stage, progress, message = null, extraData = {}) => {
-    const currentJob = jobStore.get(jobId) || {};
-    jobStore.set(jobId, {
-      ...currentJob,
-      status: 'processing', // Keep status as 'processing' until final state
-      stage: stage,
-      progress: progress,
-      ...(message && { message: message }), // Add message if provided
-      ...extraData // Add any other relevant data like fileKey
-    });
-    console.log(`[Job ${jobId}] Status Update: Stage=${stage}, Progress=${progress}%`);
+  // Helper to update job status consistently (now writes to file)
+  const updateYoutubeJobStatus = async (stage, progress, message = null, extraData = {}) => {
+    try {
+        const currentJob = await readJobData(jobId) || {};
+        const updatedJob = {
+            ...currentJob,
+            status: 'processing',
+            stage: stage,
+            progress: progress,
+            ...(message && { message: message }),
+            ...extraData
+        };
+        await writeJobData(jobId, updatedJob);
+        console.log(`[Job ${jobId}] Status Update (File): Stage=${stage}, Progress=${progress}%`);
+    } catch (error) {
+        console.error(`[Job ${jobId}] Failed to update YouTube job status file:`, error);
+    }
   };
 
-
-  // 2. Store Initial Job State ('pending')
-  // --- Set initial stage and progress ---
-  jobStore.set(jobId, {
-    status: 'processing', // Start as processing
-    stage: 'pending',     // Initial stage
-    progress: 5,          // Small initial progress
+  // 2. Store Initial Job State ('pending') (now writes to file)
+  const initialYoutubeJobData = {
+    status: 'processing',
+    stage: 'pending',
+    progress: 5,
     message: 'YouTube processing request received...',
     startTime: Date.now(),
     source: 'youtube',
     originalUrl: youtubeUrl
-  });
-  // --- End initial state ---
-  console.log(`[Job ${jobId}] Registered for YouTube URL: ${youtubeUrl}. Status: pending.`);
+  };
 
-  // 3. Return 202 Accepted Immediately
-  res.status(202).json({ jobId: jobId });
+  try {
+      await writeJobData(jobId, initialYoutubeJobData); // Write initial state
+      console.log(`[Job ${jobId}] Registered (File) for YouTube URL: ${youtubeUrl}. Status: pending.`);
 
-  // 4. Perform Tasks in Background
-  (async () => {
-    try {
-      // --- Download using yt-dlp ---
-      updateYoutubeJobStatus('downloading_youtube', 10, 'Downloading video from YouTube...'); // Example: 10%
-      const tempDir = path.join(__dirname, '..', 'temp');
-      await fsPromises.mkdir(tempDir, { recursive: true });
-      const uniqueDownloadFilename = `${jobId}-youtube-download.mp4`;
-      tempVideoPath = path.join(tempDir, uniqueDownloadFilename);
+      // 3. Return 202 Accepted Immediately
+      res.status(202).json({ jobId: jobId });
 
-      console.log(`[Job ${jobId}] Starting yt-dlp download to: ${tempVideoPath}`);
-      const ytdlpProcess = spawn('yt-dlp', [
-        '-f', 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]', // Request max 720p MP4
-        '-o', tempVideoPath,
-        '--progress', // Ask yt-dlp to report progress
-        '--', youtubeUrl
-      ]);
+      // 4. Perform Tasks in Background
+      (async () => {
+        try {
+          // --- Download using yt-dlp ---
+          await updateYoutubeJobStatus('downloading_youtube', 10, 'Downloading video from YouTube...');
+          const tempDir = path.join(__dirname, '..', 'temp');
+          await fsPromises.mkdir(tempDir, { recursive: true });
+          const uniqueDownloadFilename = `${jobId}-youtube-download.mp4`;
+          tempVideoPath = path.join(tempDir, uniqueDownloadFilename);
 
-      let ytdlpError = '';
-      ytdlpProcess.stderr.on('data', (data) => {
-        const stderrText = data.toString();
-        console.log(`[Job ${jobId}] yt-dlp stderr: ${stderrText.trim()}`);
-        ytdlpError += stderrText;
-        // Example: Parse yt-dlp progress (might need adjustment based on actual output format)
-        const progressMatch = stderrText.match(/\[download\]\s+(\d+(\.\d+)?%)/);
-        if (progressMatch && progressMatch[1]) {
-            const ytProgress = parseFloat(progressMatch[1]);
-            // Map yt-dlp 0-100% to our 10-20% range for this stage
-            const overallProgress = 10 + Math.round(ytProgress * 0.10);
-            updateYoutubeJobStatus('downloading_youtube', overallProgress, `Downloading from YouTube (${ytProgress.toFixed(1)}%)...`);
-        }
-      });
-      ytdlpProcess.stdout.on('data', (data) => {
-        console.log(`[Job ${jobId}] yt-dlp stdout: ${data.toString().trim()}`);
-      });
+          console.log(`[Job ${jobId}] Starting yt-dlp download to: ${tempVideoPath}`);
+          const ytdlpProcess = spawn('yt-dlp', [
+            '-f', 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]', // Request max 720p MP4
+            '-o', tempVideoPath,
+            '--progress', // Ask yt-dlp to report progress
+            '--', youtubeUrl
+          ]);
 
-      const downloadExitCode = await new Promise((resolve, reject) => {
-        ytdlpProcess.on('close', resolve);
-        ytdlpProcess.on('error', reject); // Handle spawn errors
-      });
-
-      if (downloadExitCode !== 0) {
-        throw new Error(`yt-dlp failed with code ${downloadExitCode}. Error: ${ytdlpError}`);
-      }
-      console.log(`[Job ${jobId}] yt-dlp download successful.`);
-      updateYoutubeJobStatus('uploading_to_s3', 20, 'Uploading video to storage...'); // Example: 20%
-
-      // --- Upload to S3 ---
-      fileKey = `uploads/youtube-${jobId}-${path.basename(tempVideoPath)}`;
-      console.log(`[Job ${jobId}] Uploading ${tempVideoPath} to S3 with key: ${fileKey}`);
-
-      const fileStream = fs.createReadStream(tempVideoPath);
-      const uploadCommand = new PutObjectCommand({
-          Bucket: process.env.AWS_BUCKET_NAME,
-          Key: fileKey,
-          Body: fileStream,
-          ContentType: 'video/mp4'
-          // Add progress tracking here if needed using Upload from @aws-sdk/lib-storage
-      });
-
-      await s3Client.send(uploadCommand);
-      console.log(`[Job ${jobId}] S3 upload successful.`);
-      updateYoutubeJobStatus('queued_for_processing', 22, 'Video queued for analysis...', { fileKey: fileKey }); // Example: 22%
-
-      // --- Cleanup yt-dlp download (after successful upload) ---
-      try {
-          await fsPromises.unlink(tempVideoPath);
-          console.log(`[Job ${jobId}] Cleaned up temporary yt-dlp download: ${tempVideoPath}`);
-          tempVideoPath = null; // Clear path after deletion
-      } catch (cleanupErr) {
-          console.warn(`[Job ${jobId}] Failed to cleanup yt-dlp download ${tempVideoPath}:`, cleanupErr);
-      }
-
-      // --- Acquire Lock (using S3 fileKey) ---
-      if (processingFiles.has(fileKey)) {
-        console.warn(`[Job ${jobId}] Lock for S3 key ${fileKey} already held. Waiting might occur.`);
-      }
-      processingFiles.add(fileKey);
-      console.log(`[Job ${jobId}] Acquired lock for S3 key: ${fileKey}`);
-
-      // --- Update Status before handing off ---
-      // The next stage ('downloading_from_s3') will be set by startBackgroundProcessing
-      updateYoutubeJobStatus('initiating_processing', 24, 'Initiating video analysis...', { fileKey: fileKey }); // Example: 24%
-
-      // --- Start Background Processing (Python script phase) ---
-      startBackgroundProcessing(jobId, fileKey); // This function will handle subsequent stages
-
-    } catch (error) {
-      // --- Handle Errors in Background Task ---
-      console.error(`[Job ${jobId}] Error during background YouTube processing:`, error);
-      const currentProgress = jobStore.get(jobId)?.progress || 0; // Keep progress where it failed
-
-      // Update job store to 'error'
-      jobStore.set(jobId, {
-          ...(jobStore.get(jobId) || {}), // Keep existing info if possible
-          status: 'error',
-          stage: 'error', // Specific error stage
-          progress: currentProgress,
-          message: `Failed during background processing: ${error.message}`,
-          details: error.stack,
-          endTime: Date.now(),
-          source: 'youtube', // Ensure source is present
-          originalUrl: youtubeUrl // Ensure originalUrl is present
-      });
-      console.log(`[Job ${jobId}] Status: error`);
-
-      // Release lock if it was acquired
-      if (fileKey && processingFiles.has(fileKey)) {
-          processingFiles.delete(fileKey);
-          console.log(`[Job ${jobId}] Released lock for key: ${fileKey} due to error.`);
-      }
-
-      // Attempt to cleanup temp download file if it still exists
-      if (tempVideoPath) {
-          fsPromises.unlink(tempVideoPath).catch(cleanupErr => {
-              if (cleanupErr.code !== 'ENOENT') {
-                  console.warn(`[Job ${jobId}] Error cleaning up temp download ${tempVideoPath} after failure:`, cleanupErr);
-              }
+          let ytdlpError = '';
+          ytdlpProcess.stderr.on('data', (data) => {
+            const stderrText = data.toString();
+            console.log(`[Job ${jobId}] yt-dlp stderr: ${stderrText.trim()}`);
+            ytdlpError += stderrText;
+            // Example: Parse yt-dlp progress (might need adjustment based on actual output format)
+            const progressMatch = stderrText.match(/\[download\]\s+(\d+(\.\d+)?%)/);
+            if (progressMatch && progressMatch[1]) {
+                const ytProgress = parseFloat(progressMatch[1]);
+                // Map yt-dlp 0-100% to our 10-20% range for this stage
+                const overallProgress = 10 + Math.round(ytProgress * 0.10);
+                updateYoutubeJobStatus('downloading_youtube', overallProgress, `Downloading from YouTube (${ytProgress.toFixed(1)}%)...`); // Async update
+            }
           });
-      }
-    }
-  })(); // Immediately invoke the async background function
+          ytdlpProcess.stdout.on('data', (data) => {
+            console.log(`[Job ${jobId}] yt-dlp stdout: ${data.toString().trim()}`);
+          });
 
+          const downloadExitCode = await new Promise((resolve, reject) => {
+            ytdlpProcess.on('close', resolve);
+            ytdlpProcess.on('error', reject); // Handle spawn errors
+          });
+
+          if (downloadExitCode !== 0) {
+            throw new Error(`yt-dlp failed with code ${downloadExitCode}. Error: ${ytdlpError}`);
+          }
+          console.log(`[Job ${jobId}] yt-dlp download successful.`);
+          await updateYoutubeJobStatus('uploading_to_s3', 20, 'Uploading video to storage...'); // Example: 20%
+
+          // --- Upload to S3 ---
+          fileKey = `uploads/youtube-${jobId}-${path.basename(tempVideoPath)}`;
+          console.log(`[Job ${jobId}] Uploading ${tempVideoPath} to S3 with key: ${fileKey}`);
+
+          const fileStream = fs.createReadStream(tempVideoPath);
+          const uploadCommand = new PutObjectCommand({
+              Bucket: process.env.AWS_BUCKET_NAME,
+              Key: fileKey,
+              Body: fileStream,
+              ContentType: 'video/mp4'
+              // Add progress tracking here if needed using Upload from @aws-sdk/lib-storage
+          });
+
+          await s3Client.send(uploadCommand);
+          console.log(`[Job ${jobId}] S3 upload successful.`);
+          await updateYoutubeJobStatus('queued_for_processing', 22, 'Video queued for analysis...', { fileKey: fileKey }); // Example: 22%
+
+          // --- Cleanup yt-dlp download (after successful upload) ---
+          try {
+              await fsPromises.unlink(tempVideoPath);
+              console.log(`[Job ${jobId}] Cleaned up temporary yt-dlp download: ${tempVideoPath}`);
+              tempVideoPath = null; // Clear path after deletion
+          } catch (cleanupErr) {
+              console.warn(`[Job ${jobId}] Failed to cleanup yt-dlp download ${tempVideoPath}:`, cleanupErr);
+          }
+
+          // --- Acquire Lock (using S3 fileKey) ---
+          if (processingFiles.has(fileKey)) {
+            console.warn(`[Job ${jobId}] Lock for S3 key ${fileKey} already held. Waiting might occur.`);
+          }
+          processingFiles.add(fileKey);
+          console.log(`[Job ${jobId}] Acquired lock for S3 key: ${fileKey}`);
+
+          // --- Update Status before handing off ---
+          // The next stage ('downloading_from_s3') will be set by startBackgroundProcessing
+          await updateYoutubeJobStatus('initiating_processing', 24, 'Initiating video analysis...', { fileKey: fileKey }); // Example: 24%
+
+          // --- Start Background Processing (Python script phase) ---
+          startBackgroundProcessing(jobId, fileKey); // This function will handle subsequent stages
+
+        } catch (error) {
+          // --- Handle Errors in Background Task ---
+          console.error(`[Job ${jobId}] Error during background YouTube processing:`, error);
+          const currentJob = await readJobData(jobId) || {}; // Read existing data
+          const youtubeErrorData = {
+              ...currentJob, // Preserve existing info
+              status: 'error',
+              stage: 'error',
+              progress: currentJob.progress || 0,
+              message: `Failed during background processing: ${error.message}`,
+              details: error.stack,
+              endTime: Date.now(),
+              // Ensure source and originalUrl are present
+              source: 'youtube',
+              originalUrl: youtubeUrl
+          };
+          await writeJobData(jobId, youtubeErrorData); // Write error status to file
+          console.log(`[Job ${jobId}] Status: error (File)`);
+          // Release lock if it was acquired
+          if (fileKey && processingFiles.has(fileKey)) {
+              processingFiles.delete(fileKey);
+              console.log(`[Job ${jobId}] Released lock for key: ${fileKey} due to error.`);
+          }
+
+          // Attempt to cleanup temp download file if it still exists
+          if (tempVideoPath) {
+              fsPromises.unlink(tempVideoPath).catch(cleanupErr => {
+                  if (cleanupErr.code !== 'ENOENT') {
+                      console.warn(`[Job ${jobId}] Error cleaning up temp download ${tempVideoPath} after failure:`, cleanupErr);
+                  }
+              });
+          }
+        }
+      })(); // Immediately invoke the async background function
+
+  } catch (error) {
+      console.error(`[Job ${jobId}] Failed to write initial YouTube job data:`, error);
+      res.status(500).json({ error: 'Failed to initialize YouTube processing job.' });
+  }
 });
 
 // --- Job Status Endpoint ---
-app.get('/process/status/:jobId', async (req, res) => { // Make the handler async
+app.get('/process/status/:jobId', async (req, res) => {
   const jobId = req.params.jobId;
-  const job = jobStore.get(jobId);
+  let job; // Use let instead of const
+
+  try {
+      job = await readJobData(jobId); // Read from file
+  } catch (error) {
+      // Error already logged in readJobData
+      return res.status(500).json({ status: 'error', message: 'Failed to read job status.' });
+  }
 
   if (!job) {
     return res.status(404).json({ status: 'not_found', message: 'Job not found.' });
@@ -648,7 +768,6 @@ app.get('/process/status/:jobId', async (req, res) => { // Make the handler asyn
 
   res.json(jobStatusToSend);
 });
-
 
 // Test endpoint
 app.post('/api/transcript/test', (req, res) => {
