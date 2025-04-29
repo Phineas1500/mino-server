@@ -164,18 +164,19 @@ async function startBackgroundProcessing(jobId, fileKey) {
              transcriptContent = finalResult.transcript || ''; // Fallback
           }
 
-          // Generate signed URL for the original video in S3
-          const videoCommand = new GetObjectCommand({
-            Bucket: process.env.AWS_BUCKET_NAME,
-            Key: fileKey
-          });
-          const originalUrl = await getSignedUrl(s3Client, videoCommand, { expiresIn: 3600 });
+          // --- REMOVE originalUrl generation here ---
+          // const videoCommand = new GetObjectCommand({
+          //   Bucket: process.env.AWS_BUCKET_NAME,
+          //   Key: fileKey
+          // });
+          // const originalUrl = await getSignedUrl(s3Client, videoCommand, { expiresIn: 3600 });
 
           // Update job store on success
           jobStore.set(jobId, {
             status: 'complete',
             data: {
-              originalUrl: originalUrl,
+              // --- STORE fileKey instead of originalUrl ---
+              fileKey: fileKey, // Store the S3 object key
               transcript: transcriptContent,
               segments: finalResult.segments || [],
               summary: finalResult.summary,
@@ -504,13 +505,35 @@ app.post('/process/youtube-url', async (req, res) => {
 
 
 // --- Job Status Endpoint ---
-app.get('/process/status/:jobId', (req, res) => {
+app.get('/process/status/:jobId', async (req, res) => { // Make the handler async
   const jobId = req.params.jobId;
   const job = jobStore.get(jobId);
 
   if (!job) {
     return res.status(404).json({ status: 'not_found', message: 'Job not found.' });
   }
+
+  // --- Generate signed URL on demand for completed jobs ---
+  if (job.status === 'complete' && job.data && job.data.fileKey) {
+    try {
+      const command = new GetObjectCommand({
+        Bucket: process.env.AWS_BUCKET_NAME,
+        Key: job.data.fileKey
+      });
+      // Generate a fresh URL valid for 1 hour (or adjust as needed)
+      const signedUrl = await getSignedUrl(s3Client, command, { expiresIn: 3600 });
+      
+      // Add the fresh URL to the data being sent
+      job.data.originalUrl = signedUrl; 
+      
+    } catch (error) {
+      console.error(`[Job ${jobId}] Error generating signed URL for status request:`, error);
+      // Optionally handle the error, e.g., return status without URL or an error status
+      // For now, we'll proceed without the URL if generation fails
+      job.data.originalUrl = null; // Indicate URL generation failed
+    }
+  }
+  // --- End URL generation ---
 
   // Optionally remove sensitive details before sending
   const { details, ...jobStatusToSend } = job;
