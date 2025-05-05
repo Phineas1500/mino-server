@@ -101,8 +101,8 @@ def analyze_segments_importance(segments, client, summary_data=None):
     analyzed_segments, _ = loop.run_until_complete(process_segments_parallel(segments, client))
     return analyzed_segments
 
-async def process_batch_async(client, batch, batch_idx, total_batches, key_points): # Add key_points parameter
-    """Process a batch of segments asynchronously with OpenAI API"""
+async def process_batch_async(client, batch, batch_idx, total_batches, key_points): # Added video_type, video_title, video_description
+    """Process a batch of segments asynchronously with OpenAI API (Original structure with updated prompts)"""
     try:
         batch_texts = [
             f"{i+1}. [{seg['start']:.1f}s - {seg['end']:.1f}s] Duration: {seg['end']-seg['start']:.1f}s\nContent: {seg['text']}"
@@ -113,17 +113,35 @@ async def process_batch_async(client, batch, batch_idx, total_batches, key_point
         segments_text = "\n\n".join(batch_texts)
         key_points_text = "\n".join([f"- {kp}" for kp in key_points]) # Format key points
 
-        importance_prompt = f"""Analyze these lecture segments based on their importance relative to the overall key points of the lecture. Return the analysis in JSON format.
+        # --- NEW Enhanced Prompt ---
+        importance_prompt = f"""Analyze these video segments based on their importance to the viewer. Return the analysis in JSON format.
 
-        OVERALL KEY POINTS:
+        OVERALL KEY POINTS/THEMES:
         {key_points_text}
 
-        RATING RULES (Consider relevance to the Key Points above):
-        - 10-8: Essential content (core concepts, definitions, key principles directly related to Key Points) → 1.0x speed
-        - 7-5: Supporting content (examples, explanations, context for Key Points) → 1.5x speed
-        - 4-1: Supplementary content (repetition, tangents, filler, loosely related info) → 2.0-2.5x speed
+        RATING GUIDELINES FOR VIDEO'S CONTENT (Consider relevance to the Key Points/Themes above, as well as what you determine about the video's type):
+        - 10-8: Essential content - The main value viewers are seeking based on the video type.
+          * For educational: Core concepts, key definitions, primary explanations
+          * For entertainment: Major punchlines, key plot developments, highlight moments
+          * For tutorials: Critical steps, important demonstrations, essential techniques
+          * For interviews: Major revelations, key insights, defining statements
+          → 1.0-1.1x speed (Approx range for calculation guidance)
 
-        PLAYBACK SPEED MUST follow this strict formula:
+        - 7-5: Supporting content - Enhances understanding or enjoyment but not the primary value.
+          * For educational: Supporting examples, context, secondary details
+          * For entertainment: Setup, context building, secondary moments
+          * For tutorials: Preparatory steps, additional context, alternative approaches
+          * For interviews: Context, follow-up questions, elaborations
+          → 1.3-1.7x speed (Approx range for calculation guidance)
+
+        - 4-1: Supplementary content - Minimal essential information, potentially distracting.
+          * For educational: Repetition, tangents, filler content, long pauses
+          * For entertainment: Excessive pauses, minor transitions, redundant elements
+          * For tutorials: Verbose explanations, non-critical asides, repetitive warnings
+          * For interviews: Small talk, extended introductions, tangential discussions
+          → 1.9-2.5x speed or potentially skippable if ≤ 3 (Approx range for calculation guidance)
+
+        PLAYBACK SPEED FORMULA (Strict - MUST be followed in JSON output):
         - Score 10: Speed 1.0
         - Score 9: Speed 1.0
         - Score 8: Speed 1.1
@@ -142,96 +160,125 @@ async def process_batch_async(client, batch, batch_idx, total_batches, key_point
         {{
             "ratings": [
                 {{
-                    "score": number,          // 1-10 rating based on importance and relevance to Key Points
-                    "speed": number,          // MUST follow the formula above based on score
+                    "score": number,          // 1-10 rating based on importance relative to this specific video's purpose
+                    "speed": number,          // MUST follow the strict formula above based on score
                     "skip": boolean,          // true if score ≤ 3
-                    "key_point": "string"     // Brief summary of the segment's content
+                    "key_point": "string"     // Brief summary justifying the rating based on the segment content and video context
                 }}
             ]
         }}"""
+        # --- End NEW Enhanced Prompt ---
 
         def execute_openai_call():
             return client.chat.completions.create(
-                model="gpt-4.1-nano-2025-04-14",
+                model="gpt-4.1-nano-2025-04-14", # Or your preferred model
                 messages=[{
                     "role": "system",
-                    "content": "You analyze educational content and return ratings in JSON format. Follow the playback speed formula precisely based on the score. Always respond with valid JSON matching the requested structure."
+                    # --- NEW Enhanced System Prompt ---
+                    "content": "You are an expert video content analyst. Your task is to analyze video segments based on the overall key points/themes. Rate each segment's importance relative to the *specific purpose* of *this* video, not against an absolute standard. Adhere strictly to the provided rating guidelines and the specific score-to-speed mapping formula. Respond ONLY with valid JSON matching the requested structure. The 'key_point' field in the JSON should briefly explain *why* the segment received its score in the context of the video's goals."
+                    # --- End NEW Enhanced System Prompt ---
                 }, {
                     "role": "user",
                     "content": importance_prompt
                 }],
                 temperature=0.3,
-                max_tokens=2000,
+                max_tokens=2000, # Adjust if needed based on batch size
                 response_format={"type": "json_object"}
             )
-        
+
         with ThreadPoolExecutor() as executor:
             response = await asyncio.get_event_loop().run_in_executor(
                 executor, execute_openai_call
             )
-        
+
         # Parse JSON response
         result = json.loads(response.choices[0].message.content)
         ratings = result.get('ratings', [])
-        
-        # --- Added Logging ---
+
+        # --- Logging and Mismatch Handling (Kept from original) ---
         log(f"[Batch {batch_idx+1}] Received {len(ratings)} ratings for {len(batch)} segments.")
         if len(ratings) != len(batch):
-             log(f"[Batch {batch_idx+1}] Warning: Rating count mismatch. Will adjust.", "WARNING")
-             # Adjust ratings array size if needed (existing logic)
-             if len(ratings) < len(batch):
-                 ratings.extend([
-                     {"score": 5, "speed": 1.7, "skip": False, "key_point": ""} 
-                     for _ in range(len(batch) - len(ratings))
-                 ])
-             else:
-                 ratings = ratings[:len(batch)]
-        # --- End Added Logging ---
+            log(f"[Batch {batch_idx+1}] Warning: Rating count mismatch. Will adjust.", "WARNING")
+            # Adjust ratings array size if needed
+            if len(ratings) < len(batch):
+                ratings.extend([
+                    {"score": 5, "speed": 1.7, "skip": False, "key_point": "Default rating due to mismatch"}
+                    for _ in range(len(batch) - len(ratings))
+                ])
+            else:
+                ratings = ratings[:len(batch)]
+        # --- End Logging and Mismatch Handling ---
 
         processed_segments = []
         batch_duration = 0
         batch_skippable = 0
-        
+
+        # --- Segment Processing Loop (Kept identical to original logic) ---
         for i, (seg, rating) in enumerate(zip(batch, ratings)): # Use enumerate for index
             try:
                 segment_duration = seg["end"] - seg["start"]
                 batch_duration += segment_duration
-                
-                # --- Added Logging ---
+
                 log(f"[Batch {batch_idx+1}, Seg {i+1}] Original Segment: start={seg['start']:.1f}, end={seg['end']:.1f}, text='{seg['text'][:50]}...'")
                 log(f"[Batch {batch_idx+1}, Seg {i+1}] Received Rating: {rating}")
-                # --- End Added Logging ---
 
-                importance_score = float(rating.get('score', 5))
-                importance_score = max(1, min(10, importance_score))
-                
-                # Calculate playback speed based on score using our formula
-                # This ensures a direct relationship between score and speed
+                importance_score = 5 # Default score
+                api_speed = 0.0 # Default speed indicator
+                can_skip = False # Default skip status
+                reason_text = "Default rating" # Default reason
+
+                # Safely get rating components
+                try:
+                    importance_score = float(rating.get('score', 5))
+                    importance_score = max(1, min(10, importance_score)) # Clamp score 1-10
+                except (ValueError, TypeError):
+                     log(f"[Batch {batch_idx+1}, Seg {i+1}] Warning: Invalid score type in rating ({rating.get('score')}). Using default score 5.", "WARNING")
+                     importance_score = 5
+
+                try:
+                    api_speed = float(rating.get('speed', 0.0))
+                except (ValueError, TypeError):
+                     log(f"[Batch {batch_idx+1}, Seg {i+1}] Warning: Invalid speed type in rating ({rating.get('speed')}). Will calculate speed from score.", "WARNING")
+                     api_speed = 0.0 # Indicate calculation needed
+
+                try:
+                     # Use 'skip' field if present, otherwise derive from score
+                    if 'skip' in rating:
+                         can_skip = bool(rating.get('skip'))
+                    else:
+                         can_skip = importance_score <= 3
+                except Exception: # Catch potential errors converting to bool
+                    log(f"[Batch {batch_idx+1}, Seg {i+1}] Warning: Invalid skip type in rating ({rating.get('skip')}). Deriving from score.", "WARNING")
+                    can_skip = importance_score <= 3
+
+                reason_text = rating.get('key_point', 'No reason provided')
+
+                # Calculate playback speed based on score using the strict formula
                 playback_speed_map = {
                     10: 1.0, 9: 1.0, 8: 1.1,
                     7: 1.3, 6: 1.5, 5: 1.7,
                     4: 1.9, 3: 2.1, 2: 2.3, 1: 2.5
                 }
-                default_speed = 1.5
-                
-                # First try to use the speed from the API response
-                api_speed = float(rating.get('speed', 0.0))
-                
-                # If API speed is valid, use it, otherwise calculate from the score
-                if 1.0 <= api_speed <= 2.5:
-                    playback_speed = api_speed
+                default_speed = 1.5 # Fallback speed
+
+                # Verify API speed against the formula for the score, or calculate if invalid/missing
+                expected_speed = playback_speed_map.get(int(importance_score), default_speed)
+                if 1.0 <= api_speed <= 2.5 and abs(api_speed - expected_speed) < 0.01: # Check if API speed is valid and matches formula
+                     playback_speed = api_speed
+                     log(f"[Batch {batch_idx+1}, Seg {i+1}] Using valid speed from API: {api_speed}", "DEBUG")
                 else:
-                    # Fallback to calculating from score
-                    playback_speed = playback_speed_map.get(int(importance_score), default_speed)
-                
-                # Ensure speed is within bounds
+                    if api_speed != 0.0: # Log if API provided an invalid speed
+                         log(f"[Batch {batch_idx+1}, Seg {i+1}] Warning: API speed ({api_speed}) is invalid or doesn't match score ({importance_score}). Calculating speed based on score.", "WARNING")
+                    playback_speed = expected_speed # Calculate speed based on score
+                    log(f"[Batch {batch_idx+1}, Seg {i+1}] Calculated speed based on score: {playback_speed}", "DEBUG")
+
+
+                # Ensure speed is within bounds (redundant check, but safe)
                 playback_speed = max(1.0, min(2.5, playback_speed))
-                
-                can_skip = bool(rating.get('skip', importance_score <= 3))
-                
+
                 if can_skip:
                     batch_skippable += segment_duration
-                
+
                 processed_segment_data = {
                     "start": seg["start"],
                     "end": seg["end"],
@@ -240,61 +287,66 @@ async def process_batch_async(client, batch, batch_idx, total_batches, key_point
                     "importance_score": importance_score,
                     "playback_speed": playback_speed,
                     "original_duration": segment_duration,
-                    "adjusted_duration": segment_duration / playback_speed,
-                    "reason": rating.get('key_point', '')
+                    "adjusted_duration": segment_duration / playback_speed if playback_speed > 0 else segment_duration, # Avoid division by zero
+                    "reason": reason_text # Use the reason from the API or default
                 }
                 processed_segments.append(processed_segment_data)
 
-                # --- Added Logging ---
                 log(f"[Batch {batch_idx+1}, Seg {i+1}] Processed Segment: score={importance_score}, speed={playback_speed}, skip={can_skip}, text='{processed_segment_data['text'][:50]}...'")
                 if importance_score <= 1:
-                     log(f"[Batch {batch_idx+1}, Seg {i+1}] Low score segment (<=1) processed. Text included: {'Yes' if processed_segment_data['text'] else 'No'}", "DEBUG")
-                # --- End Added Logging ---
-                
+                    log(f"[Batch {batch_idx+1}, Seg {i+1}] Low score segment (<=1) processed. Text included: {'Yes' if processed_segment_data['text'] else 'No'}", "DEBUG")
+
             except Exception as e:
                 log(f"Error processing segment {i+1} in batch {batch_idx+1}: {str(e)}", "WARNING")
-                # Add default values for failed segments
-                segment_duration = seg["end"] - seg["start"]
+                # Add default values for failed segments (Kept identical)
+                segment_duration = seg.get("end", 0) - seg.get("start", 0)
                 default_segment = {
-                    "start": seg["start"],
-                    "end": seg["end"],
-                    "text": seg["text"], # Ensure text is included even in default
+                    "start": seg.get("start", 0),
+                    "end": seg.get("end", 0),
+                    "text": seg.get("text", "[Text missing due to segment error]"), # Ensure text is included
                     "can_skip": False,
                     "importance_score": 5,
                     "playback_speed": 1.5,
                     "original_duration": segment_duration,
-                    "adjusted_duration": segment_duration / 1.5,
+                    "adjusted_duration": segment_duration / 1.5 if segment_duration > 0 else 0,
                     "reason": f"Error processing segment: {str(e)[:50]}"
                 }
                 processed_segments.append(default_segment)
                 log(f"[Batch {batch_idx+1}, Seg {i+1}] Added default segment due to error. Text included: {'Yes' if default_segment['text'] else 'No'}", "WARNING")
-        
-        # --- Added Logging ---
+        # --- End Segment Processing Loop ---
+
         log(f"[Batch {batch_idx+1}] Finished processing. Produced {len(processed_segments)} segments.")
-        # --- End Added Logging ---
         return {
             "segments": processed_segments,
             "total_duration": batch_duration,
             "skippable_duration": batch_skippable
         }
-        
+
     except Exception as e:
         log(f"Error in batch {batch_idx+1}: {str(e)}", "ERROR")
-        # --- Added Logging ---
         log(f"[Batch {batch_idx+1}] Returning default segments due to batch error. Input count: {len(batch)}")
-        # --- End Added Logging ---
+        # Return default structure on batch error (Kept identical)
+        default_segments = []
+        batch_total_duration = 0
+        for seg in batch:
+             duration = seg.get("end", 0) - seg.get("start", 0)
+             batch_total_duration += duration
+             default_segments.append({
+                 "start": seg.get("start", 0),
+                 "end": seg.get("end", 0),
+                 "text": seg.get("text", "[Text missing due to batch error]"), # Ensure text field exists
+                 "can_skip": False,
+                 "importance_score": 5,
+                 "playback_speed": 1.5,
+                 "original_duration": duration,
+                 "adjusted_duration": duration / 1.5 if duration > 0 else 0,
+                 "reason": f"Batch error: {str(e)[:50]}",
+                 # Ensure all keys expected by later code are present, even in error case
+                 # Add **seg if you need absolutely all original keys, but be cautious
+             })
         return {
-            "segments": [{
-                **seg,
-                "can_skip": False,
-                "importance_score": 5,
-                "playback_speed": 1.5,
-                "original_duration": seg["end"] - seg["start"],
-                "adjusted_duration": (seg["end"] - seg["start"]) / 1.5,
-                "reason": f"Batch error: {str(e)[:50]}",
-                "text": seg.get("text", "[Text missing due to batch error]") # Ensure text field exists
-            } for seg in batch],
-            "total_duration": sum(seg["end"] - seg["start"] for seg in batch),
+            "segments": default_segments,
+            "total_duration": batch_total_duration,
             "skippable_duration": 0
         }
         
@@ -714,7 +766,7 @@ async def process_audio(audio_data: bytes, filename: str):
             # --- Transcribe with Whisper ---
             report_progress(PROGRESS_START, "loading_model", "Loading transcription model...")
             log("Loading Whisper model...")
-            model = whisper.load_model("tiny")
+            model = whisper.load_model("small")
             report_progress(PROGRESS_LOAD_MODEL_END, "loading_model", "Transcription model loaded.")
 
             report_progress(PROGRESS_LOAD_MODEL_END, "transcribing", "Starting transcription...")
@@ -957,7 +1009,7 @@ async def process_video(video_data: bytes, filename: str):
             # --- Transcribe with Whisper ---
             report_progress(PROGRESS_EXTRACT_AUDIO_END, "loading_model", "Loading transcription model...")
             log("Loading Whisper model...")
-            model = whisper.load_model("tiny")
+            model = whisper.load_model("small")
             report_progress(PROGRESS_LOAD_MODEL_END, "loading_model", "Transcription model loaded.")
 
             report_progress(PROGRESS_LOAD_MODEL_END, "transcribing", "Starting transcription...")
