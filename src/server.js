@@ -11,6 +11,7 @@ const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { generatePresignedUrl, s3Client } = require('./services/s3');
 const { promises: fsPromises } = require('fs');
 const { v4: uuidv4 } = require('uuid'); // Import uuid for generating job IDs
+const OpenAI = require('openai'); // Added OpenAI
 
 // --- Define job data directory ---
 const JOB_DATA_DIR = path.join(__dirname, '..', 'jobdata');
@@ -18,6 +19,17 @@ const JOB_DATA_DIR = path.join(__dirname, '..', 'jobdata');
 // --- Ensure job data directory exists ---
 fsPromises.mkdir(JOB_DATA_DIR, { recursive: true })
   .catch(err => console.error('Failed to create job data directory:', err));
+
+// --- Initialize OpenAI Client ---
+let openai;
+if (process.env.OPENAI_API_KEY) {
+  openai = new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY,
+  });
+} else {
+  console.warn("OPENAI_API_KEY not found in .env file. Chat functionality will be limited.");
+}
+// --- ---
 
 process.on('unhandledRejection', (reason, promise) => {
   console.error('Unhandled Rejection at:', promise, 'reason:', reason);
@@ -767,6 +779,102 @@ app.get('/process/status/:jobId', async (req, res) => {
   const { details, ...jobStatusToSend } = job;
 
   res.json(jobStatusToSend);
+});
+
+// --- Chat API Endpoint ---
+app.post('/api/chat', async (req, res) => {
+  const { message, jobId } = req.body;
+
+  if (!openai) {
+    return res.status(503).json({ message: "Chat service is not configured. Missing API key." });
+  }
+
+  if (!message || !jobId) {
+    return res.status(400).json({ message: 'Message and jobId are required.' });
+  }
+
+  console.log(`[Chat API] Received message for jobId ${jobId}: "${message}"`);
+
+  try {
+    const jobData = await readJobData(jobId);
+
+    if (!jobData) {
+      return res.status(404).json({ message: `Job data not found for ID: ${jobId}. Cannot provide context for chat.` });
+    }
+
+    if (jobData.status !== 'complete' || !jobData.data) {
+      return res.status(400).json({ message: `Job ${jobId} is not yet complete or has no data. Please wait for processing to finish.` });
+    }
+
+    const { summary, keyPoints, transcript } = jobData.data;
+    
+    let limitedContext = "";
+    if (summary) {
+      limitedContext += `Video Summary:\n${summary}\n\n`;
+    }
+    if (keyPoints && keyPoints.length > 0) {
+      limitedContext += `Key Points:\n${keyPoints.join('\n')}\n\n`;
+    }
+
+    // First call to the LLM
+    const initialCompletion = await openai.chat.completions.create({
+      model: "gpt-4.1-nano-2025-04-14", 
+      messages: [
+        {
+          role: "system",
+          content: `You are a helpful assistant discussing a video. Provided context includes a summary and key points.\nVideo Context:\n${limitedContext}\nYour task is to answer the user's question based *only* on the Video Context provided above. If you can provide a confident and accurate answer using *only* this summary and key points, please do so directly. If, and only if, you determine that the full video transcript is *absolutely necessary* to answer the question accurately, then respond with the exact phrase:\nNEED_FULL_TRANSCRIPT\nDo not add any other text or explanation if you output NEED_FULL_TRANSCRIPT. Otherwise, answer the question.`
+        },
+        {
+          role: "user",
+          content: message
+        }
+      ],
+      temperature: 0.7,
+      max_tokens: 300, 
+    });
+
+    let botReply = initialCompletion.choices[0]?.message?.content?.trim();
+
+    if (botReply === "NEED_FULL_TRANSCRIPT") {
+      console.log(`[Chat API] LLM indicated NEED_FULL_TRANSCRIPT for jobId ${jobId}. Making a second call with full transcript.`);
+      
+      let fullContext = limitedContext; // Start with summary and keypoints
+      if (transcript) {
+        fullContext += `Full Transcript:\n${transcript}\n\n`; // Append full transcript
+      }
+
+      const secondCompletion = await openai.chat.completions.create({
+        model: "gpt-4.1-nano-2025-04-14", 
+        messages: [
+          {
+            role: "system",
+            content: `You are a helpful assistant discussing a video. You previously indicated that the full transcript was needed to answer the user's question. The full context including summary, key points, and the transcript is now provided.\nFull Video Context:\n${fullContext}\nPlease now answer the user's original question using this complete context.`
+          },
+          {
+            role: "user",
+            content: message // User's original message
+          }
+        ],
+        temperature: 0.7,
+        max_tokens: 300, // Adjust as needed, ensure it's enough for a detailed answer
+      });
+      botReply = secondCompletion.choices[0]?.message?.content?.trim() || "Sorry, I couldn't generate a response after fetching the full transcript.";
+    }
+    
+    if (!botReply) {
+        botReply = "Sorry, I couldn't generate a response.";
+    }
+
+    res.json({ reply: botReply });
+
+  } catch (error) {
+    console.error(`[Chat API] Error processing chat for jobId ${jobId}:`, error);
+    if (error.response) { 
+        console.error('[Chat API] OpenAI Error Status:', error.response.status);
+        console.error('[Chat API] OpenAI Error Data:', error.response.data);
+    }
+    res.status(500).json({ message: 'An error occurred while processing your chat message.' });
+  }
 });
 
 // Test endpoint
