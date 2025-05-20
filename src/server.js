@@ -621,9 +621,12 @@ app.post('/process/youtube-url', async (req, res) => {
 
           console.log(`[Job ${jobId}] Starting yt-dlp download to: ${tempVideoPath}`);
           const ytdlpProcess = spawn('yt-dlp', [
-            '-f', 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]', // Request max 720p MP4
+            '-f', 'best[height<=720][ext=mp4]/best[height<=720]',  // Simplified format selection for better compatibility
+            '--merge-output-format', 'mp4',  // Force MP4 output
+            '--prefer-ffmpeg',  // Use ffmpeg for merging
+            '--postprocessor-args', '-c:v libx264 -c:a aac -movflags +faststart',  // Ensure mobile-friendly codecs and fast start
             '-o', tempVideoPath,
-            '--progress', // Ask yt-dlp to report progress
+            '--progress',
             '--', youtubeUrl
           ]);
 
