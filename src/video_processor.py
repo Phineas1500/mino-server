@@ -26,19 +26,120 @@ def process_video(input_path, output_path):
         result = None # Initialize result
 
         try:
-            # Extract audio using ffmpeg
+            # First, check if the input file exists and has content
+            if not input_path.exists():
+                raise Exception(f"Input video file does not exist: {input_path}")
+            
+            file_size = input_path.stat().st_size
+            sys.stderr.write(f"Input video file size: {file_size} bytes\n")
+            if file_size == 0:
+                raise Exception(f"Input video file is empty: {input_path}")
+            
+            # Try to get video info first to check if it's valid
+            sys.stderr.write("Checking video file with ffprobe...\n")
+            try:
+                ffprobe_cmd = [
+                    'ffprobe', '-v', 'quiet', '-print_format', 'json', 
+                    '-show_streams', '-show_format', str(input_path)
+                ]
+                probe_result = subprocess.run(ffprobe_cmd, capture_output=True, text=True, check=True)
+                probe_info = json.loads(probe_result.stdout)
+                
+                # Check if there are any audio streams
+                audio_streams = [s for s in probe_info.get('streams', []) if s.get('codec_type') == 'audio']
+                sys.stderr.write(f"Found {len(audio_streams)} audio stream(s)\n")
+                
+                if not audio_streams:
+                    sys.stderr.write("Warning: No audio streams found in video\n")
+                
+            except subprocess.CalledProcessError as e:
+                sys.stderr.write(f"ffprobe failed: {e}\n")
+                sys.stderr.write(f"ffprobe stderr: {e.stderr}\n")
+                # Continue anyway, might still work
+            except Exception as e:
+                sys.stderr.write(f"Error running ffprobe: {e}\n")
+                # Continue anyway
+            
+            # Extract audio using ffmpeg with better error handling
             sys.stderr.write(f"Extracting audio to {temp_audio_path}...\n")
-            ffmpeg_cmd = [
-                'ffmpeg',
-                '-i', str(input_path),
-                '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
-                '-y', temp_audio_path
+            
+            # Try multiple ffmpeg configurations
+            ffmpeg_configs = [
+                # Config 1: Standard extraction
+                [
+                    'ffmpeg', '-i', str(input_path),
+                    '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
+                    '-y', temp_audio_path
+                ],
+                # Config 2: More permissive with auto codec detection
+                [
+                    'ffmpeg', '-i', str(input_path),
+                    '-vn', '-ar', '16000', '-ac', '1',
+                    '-y', temp_audio_path
+                ],
+                # Config 3: Force decode any audio present
+                [
+                    'ffmpeg', '-i', str(input_path),
+                    '-map', '0:a?', '-ar', '16000', '-ac', '1',
+                    '-y', temp_audio_path
+                ]
             ]
-            # Redirect ffmpeg output to prevent interfering with final JSON
-            subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE) 
+            
+            extraction_success = False
+            last_error = ""
+            
+            for i, ffmpeg_cmd in enumerate(ffmpeg_configs):
+                try:
+                    sys.stderr.write(f"Trying ffmpeg config {i+1}...\n")
+                    result = subprocess.run(ffmpeg_cmd, check=True, capture_output=True, text=True)
+                    
+                    # Check if audio file was created and has content
+                    if os.path.exists(temp_audio_path) and os.path.getsize(temp_audio_path) > 0:
+                        extraction_success = True
+                        audio_size = os.path.getsize(temp_audio_path)
+                        sys.stderr.write(f"Audio extraction successful with config {i+1}: {audio_size} bytes\n")
+                        break
+                    else:
+                        sys.stderr.write(f"Config {i+1} produced no output\n")
+                        
+                except subprocess.CalledProcessError as e:
+                    last_error = f"Config {i+1} failed: {e.stderr}"
+                    sys.stderr.write(f"{last_error}\n")
+                    continue
+            
+            if not extraction_success:
+                # Final fallback: if video has no audio, generate silent audio track
+                if not audio_streams:
+                    sys.stderr.write("No audio found - generating silent audio track...\n")
+                    try:
+                        # Get video duration for silent audio generation
+                        duration_cmd = [
+                            'ffprobe', '-v', 'quiet', '-show_entries', 'format=duration',
+                            '-of', 'csv=p=0', str(input_path)
+                        ]
+                        duration_result = subprocess.run(duration_cmd, capture_output=True, text=True, check=True)
+                        duration = float(duration_result.stdout.strip())
+                        
+                        # Generate silent audio track matching video duration
+                        silent_cmd = [
+                            'ffmpeg', '-f', 'lavfi', '-i', f'anullsrc=channel_layout=mono:sample_rate=16000',
+                            '-t', str(duration), '-y', temp_audio_path
+                        ]
+                        subprocess.run(silent_cmd, check=True, capture_output=True, text=True)
+                        
+                        if os.path.exists(temp_audio_path) and os.path.getsize(temp_audio_path) > 0:
+                            extraction_success = True
+                            audio_size = os.path.getsize(temp_audio_path)
+                            sys.stderr.write(f"Generated silent audio track: {audio_size} bytes\n")
+                        
+                    except Exception as e:
+                        sys.stderr.write(f"Failed to generate silent audio: {e}\n")
+                
+                if not extraction_success:
+                    raise Exception(f"All ffmpeg configurations failed and unable to generate silent audio. Last error: {last_error}")
             
             audio_size = os.path.getsize(temp_audio_path)
-            sys.stderr.write(f"Extracted audio: {audio_size} bytes\n")
+            sys.stderr.write(f"Final extracted audio: {audio_size} bytes\n")
             
             with open(temp_audio_path, 'rb') as audio_file:
                 audio_data = audio_file.read()

@@ -90,6 +90,28 @@ function getPythonCommand() {
   return 'python3'; // fallback to system python
 }
 
+// Helper function to check if yt-dlp is available
+async function checkYtDlpAvailable() {
+  return new Promise((resolve) => {
+    const testProcess = spawn('yt-dlp', ['--version']);
+    
+    testProcess.on('close', (code) => {
+      resolve(code === 0);
+    });
+    
+    testProcess.on('error', (err) => {
+      console.log('yt-dlp not found or not executable:', err.message);
+      resolve(false);
+    });
+    
+    // Add timeout to prevent hanging
+    setTimeout(() => {
+      testProcess.kill();
+      resolve(false);
+    }, 5000);
+  });
+}
+
 // --- Helper function to read job data ---
 async function readJobData(jobId) {
   const filePath = path.join(JOB_DATA_DIR, `${jobId}.json`);
@@ -612,6 +634,12 @@ app.post('/process/youtube-url', async (req, res) => {
       // 4. Perform Tasks in Background
       (async () => {
         try {
+          // --- Check yt-dlp availability first ---
+          const ytDlpAvailable = await checkYtDlpAvailable();
+          if (!ytDlpAvailable) {
+            throw new Error('yt-dlp is not installed or not accessible. Please install yt-dlp to download YouTube videos. Run: pip install yt-dlp');
+          }
+
           // --- Download using yt-dlp ---
           await updateYoutubeJobStatus('downloading_youtube', 10, 'Downloading video from YouTube...');
           const tempDir = path.join(__dirname, '..', 'temp');
@@ -619,48 +647,128 @@ app.post('/process/youtube-url', async (req, res) => {
           const uniqueDownloadFilename = `${jobId}-youtube-download.mp4`;
           tempVideoPath = path.join(tempDir, uniqueDownloadFilename);
 
-          console.log(`[Job ${jobId}] Starting yt-dlp download to: ${tempVideoPath}`);
-          const ytdlpProcess = spawn('yt-dlp', [
-            '-f', 'best[height<=720][ext=mp4]/best[height<=720]',  // Simplified format selection for better compatibility
-            '--merge-output-format', 'mp4',  // Force MP4 output
-            '--prefer-ffmpeg',  // Use ffmpeg for merging
-            '--postprocessor-args', '-c:v libx264 -c:a aac -movflags +faststart',  // Ensure mobile-friendly codecs and fast start
-            '-o', tempVideoPath,
-            '--progress',
-            '--', youtubeUrl
-          ]);
+          // Function to attempt download with different yt-dlp configurations
+          const attemptDownload = async (attemptNumber, config) => {
+            console.log(`[Job ${jobId}] Download attempt ${attemptNumber} with config: ${config.name}`);
+            
+            return new Promise((resolve, reject) => {
+              const ytdlpProcess = spawn('yt-dlp', config.args);
+              let ytdlpError = '';
 
-          let ytdlpError = '';
-          ytdlpProcess.stderr.on('data', (data) => {
-            const stderrText = data.toString();
-            console.log(`[Job ${jobId}] yt-dlp stderr: ${stderrText.trim()}`);
-            ytdlpError += stderrText;
-            // Example: Parse yt-dlp progress (might need adjustment based on actual output format)
-            const progressMatch = stderrText.match(/\[download\]\s+(\d+(\.\d+)?%)/);
-            if (progressMatch && progressMatch[1]) {
-                const ytProgress = parseFloat(progressMatch[1]);
-                // Map yt-dlp 0-100% to our 10-20% range for this stage
-                const overallProgress = 10 + Math.round(ytProgress * 0.10);
-                updateYoutubeJobStatus('downloading_youtube', overallProgress, `Downloading from YouTube (${ytProgress.toFixed(1)}%)...`); // Async update
+              ytdlpProcess.stderr.on('data', (data) => {
+                const stderrText = data.toString();
+                console.log(`[Job ${jobId}] yt-dlp stderr (attempt ${attemptNumber}): ${stderrText.trim()}`);
+                ytdlpError += stderrText;
+                
+                // Parse progress for UI updates
+                const progressMatch = stderrText.match(/\[download\]\s+(\d+(\.\d+)?%)/);
+                if (progressMatch && progressMatch[1]) {
+                  const ytProgress = parseFloat(progressMatch[1]);
+                  const overallProgress = 10 + Math.round(ytProgress * 0.10);
+                  updateYoutubeJobStatus('downloading_youtube', overallProgress, `Downloading from YouTube (${ytProgress.toFixed(1)}%) - Attempt ${attemptNumber}...`);
+                }
+              });
+
+              ytdlpProcess.stdout.on('data', (data) => {
+                console.log(`[Job ${jobId}] yt-dlp stdout (attempt ${attemptNumber}): ${data.toString().trim()}`);
+              });
+
+              ytdlpProcess.on('close', (code) => {
+                if (code === 0) {
+                  resolve({ success: true, attempt: attemptNumber });
+                } else {
+                  resolve({ success: false, code, error: ytdlpError, attempt: attemptNumber });
+                }
+              });
+
+              ytdlpProcess.on('error', (err) => {
+                reject({ success: false, error: err.message, attempt: attemptNumber });
+              });
+            });
+          };
+
+          // Define different download configurations with fallbacks
+          const downloadConfigs = [
+            {
+              name: 'basic_audio_video',
+              args: [
+                '--format', 'bestaudio+bestvideo/best',  // Try to merge audio+video or get best with audio
+                '--merge-output-format', 'mp4',
+                '--no-warnings',
+                '-o', tempVideoPath,
+                '--', youtubeUrl
+              ]
+            },
+            {
+              name: 'optimized',
+              args: [
+                '-f', 'best[height<=720][acodec!=none]/best[height<=1080][acodec!=none]/best[acodec!=none]',  // Ensure audio is present
+                '--merge-output-format', 'mp4',
+                '--prefer-ffmpeg',
+                '--postprocessor-args', 'ffmpeg:-c:v libx264 -c:a aac -movflags +faststart',
+                '--no-warnings',
+                '--ignore-errors',
+                '--extract-flat', 'false',
+                '--no-playlist',
+                '-o', tempVideoPath,
+                '--progress',
+                '--', youtubeUrl
+              ]
+            },
+            {
+              name: 'simple',
+              args: [
+                '-f', 'best[acodec!=none]/worst[acodec!=none]',  // Ensure audio is present
+                '--merge-output-format', 'mp4',
+                '--no-warnings',
+                '-o', tempVideoPath,
+                '--progress',
+                '--', youtubeUrl
+              ]
             }
-          });
-          ytdlpProcess.stdout.on('data', (data) => {
-            console.log(`[Job ${jobId}] yt-dlp stdout: ${data.toString().trim()}`);
-          });
+          ];
 
-          const downloadExitCode = await new Promise((resolve, reject) => {
-            ytdlpProcess.on('close', resolve);
-            ytdlpProcess.on('error', reject); // Handle spawn errors
-          });
+          console.log(`[Job ${jobId}] Starting yt-dlp download to: ${tempVideoPath}`);
+          let downloadResult = null;
+          let lastError = '';
 
-          if (downloadExitCode !== 0) {
-            throw new Error(`yt-dlp failed with code ${downloadExitCode}. Error: ${ytdlpError}`);
+          // Try each configuration
+          for (let i = 0; i < downloadConfigs.length; i++) {
+            try {
+              downloadResult = await attemptDownload(i + 1, downloadConfigs[i]);
+              
+              if (downloadResult.success) {
+                console.log(`[Job ${jobId}] yt-dlp download successful on attempt ${downloadResult.attempt}`);
+                break;
+              } else {
+                lastError = downloadResult.error;
+                console.log(`[Job ${jobId}] Attempt ${downloadResult.attempt} failed with code ${downloadResult.code}`);
+                
+                // If this isn't the last attempt, wait a bit before retrying
+                if (i < downloadConfigs.length - 1) {
+                  console.log(`[Job ${jobId}] Waiting 2 seconds before next attempt...`);
+                  await new Promise(resolve => setTimeout(resolve, 2000));
+                }
+              }
+            } catch (error) {
+              console.log(`[Job ${jobId}] Attempt ${i + 1} threw error:`, error);
+              lastError = error.error || error.message;
+            }
           }
-          console.log(`[Job ${jobId}] yt-dlp download successful.`);
+
+          // Check if all attempts failed
+          if (!downloadResult || !downloadResult.success) {
+            const errorMessage = `Failed to download YouTube video after ${downloadConfigs.length} attempts. ` +
+              `This may be due to: 1) YouTube's anti-bot measures, 2) The video being private/restricted, ` +
+              `3) An outdated yt-dlp version, or 4) Network issues. ` +
+              `Last error: ${lastError}. ` +
+              `Consider updating yt-dlp: pip install --upgrade yt-dlp`;
+            throw new Error(errorMessage);
+          }
           await updateYoutubeJobStatus('uploading_to_s3', 20, 'Uploading video to storage...'); // Example: 20%
 
           // --- Upload to S3 ---
-          fileKey = `uploads/youtube-${jobId}-${path.basename(tempVideoPath)}`;
+          fileKey = `uploads/youtube-${path.basename(tempVideoPath)}`;
           console.log(`[Job ${jobId}] Uploading ${tempVideoPath} to S3 with key: ${fileKey}`);
 
           const fileStream = fs.createReadStream(tempVideoPath);
