@@ -25,6 +25,44 @@ def report_progress(percentage: int, stage: str, message: str = None):
     print(log_msg, flush=True) # Use flush=True
     sys.stdout.flush() # Explicit flush
 
+def calculate_optimal_flashcard_count(segments, transcript):
+    """Calculate optimal number of flashcards based on video length and content richness"""
+    # Calculate total video duration
+    total_duration = sum(seg["end"] - seg["start"] for seg in segments) if segments else 0
+    
+    # Calculate content metrics
+    transcript_length = len(transcript) if transcript else 0
+    segment_count = len(segments) if segments else 0
+    
+    # Base number of flashcards (minimum)
+    base_count = 3
+    
+    # Add flashcards based on duration (1 per 2 minutes)
+    duration_bonus = int(total_duration / 120)  # Every 2 minutes
+    
+    # Add flashcards based on transcript length (1 per 800 characters)
+    content_bonus = int(transcript_length / 800)
+    
+    # Add flashcards based on segment density (indicates information richness)
+    # More segments per minute = more dense content
+    if total_duration > 0:
+        segments_per_minute = (segment_count / total_duration) * 60
+        density_bonus = int(segments_per_minute / 3)  # Every 3 segments per minute
+    else:
+        density_bonus = 0
+    
+    # Calculate total with bonuses
+    total_flashcards = base_count + duration_bonus + content_bonus + density_bonus
+    
+    # Cap between 3 and 20 flashcards
+    optimal_count = max(3, min(20, total_flashcards))
+    
+    log(f"Flashcard calculation: duration={total_duration:.1f}s, transcript_len={transcript_length}, segments={segment_count}")
+    log(f"Bonuses: duration_bonus={duration_bonus}, content_bonus={content_bonus}, density_bonus={density_bonus}")
+    log(f"Optimal flashcard count: {optimal_count}")
+    
+    return optimal_count
+
 def fix_overlapping_segments(segments):
     """Fix any overlapping segments by adjusting end times"""
     if not segments:
@@ -798,6 +836,12 @@ async def process_audio(audio_data: bytes, filename: str):
             log("Generating educational content...")
             client = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
+            # Calculate optimal number of flashcards based on content
+            optimal_flashcard_count = calculate_optimal_flashcard_count(segments, transcript)
+            
+            # Adjust key points count based on flashcard count (minimum 3, scale with flashcards)
+            key_points_count = max(3, min(optimal_flashcard_count, 8))
+
             content_prompt = f"""Extract the core educational value from this transcript and return as JSON.
 
             ANALYSIS REQUIREMENTS:
@@ -811,28 +855,27 @@ async def process_audio(audio_data: bytes, filename: str):
             {{
                 "summary": "Clear, concise 2-paragraph summary of core concepts only",
                 "keyPoints": [
-                    "5 essential insights that represent the most important takeaways",
-                    ...4 more key points...
+                    "{key_points_count} essential insights that represent the most important takeaways"
                 ],
                 "flashcards": [
                     {{
                         "question": "Conceptual question testing understanding",
                         "answer": "Precise, factual answer focusing on core concept"
-                    }},
-                    ...4 more flashcards covering different concepts...
+                    }}
+                    ...exactly {optimal_flashcard_count} flashcards covering different concepts, ensuring comprehensive coverage of the material...
                 ]
             }}
 
             TRANSCRIPT:
             {transcript[:4000]}"""  # Limit transcript length to avoid token limits
 
-            log("Generating educational content with OpenAI...")
+            log(f"Generating educational content with {optimal_flashcard_count} flashcards and {key_points_count} key points...")
             content_response = client.chat.completions.create(
                 model="gpt-4.1-nano-2025-04-14",
                 messages=[
                     {
                         "role": "system",
-                        "content": "You are an expert at analyzing educational content and returning results in JSON format. Always respond with valid JSON that matches the requested structure."
+                        "content": f"You are an expert at analyzing educational content and returning results in JSON format. Generate exactly {optimal_flashcard_count} diverse flashcards that comprehensively cover the material. Always respond with valid JSON matching the requested structure."
                     },
                     {
                         "role": "user",
@@ -840,7 +883,7 @@ async def process_audio(audio_data: bytes, filename: str):
                     }
                 ],
                 temperature=0.5,
-                max_tokens=2000,
+                max_tokens=3000,  # Increased token limit to accommodate more flashcards
                 response_format={"type": "json_object"}
             )
 
@@ -858,17 +901,30 @@ async def process_audio(audio_data: bytes, filename: str):
                     
                 if not isinstance(content_data["flashcards"], list) or len(content_data["flashcards"]) == 0:
                     raise ValueError("Invalid or empty flashcards in response")
+                
+                # Log the actual counts vs expected
+                actual_flashcards = len(content_data["flashcards"])
+                actual_keypoints = len(content_data["keyPoints"])
+                log(f"Generated {actual_flashcards} flashcards (expected {optimal_flashcard_count}) and {actual_keypoints} key points (expected {key_points_count})")
+                
+                # Warn if counts don't match but don't fail - the API did its best
+                if actual_flashcards != optimal_flashcard_count:
+                    log(f"Warning: Got {actual_flashcards} flashcards instead of requested {optimal_flashcard_count}", "WARNING")
+                if actual_keypoints != key_points_count:
+                    log(f"Warning: Got {actual_keypoints} key points instead of requested {key_points_count}", "WARNING")
                     
             except (json.JSONDecodeError, KeyError, IndexError, ValueError) as e:
                 log(f"Error parsing OpenAI response: {str(e)}", "ERROR")
+                # Create fallback content with the optimal counts
                 content_data = {
-                    "summary": "Error generating summary",
-                    "keyPoints": ["Error generating key points"],
-                    "flashcards": [{"question": "Error", "answer": "Error generating flashcards"}]
+                    "summary": "Error generating summary - content analysis failed",
+                    "keyPoints": [f"Key point {i+1}: Error generating content" for i in range(key_points_count)],
+                    "flashcards": [{"question": f"Question {i+1}: Error generating content", "answer": f"Answer {i+1}: Error generating content"} for i in range(optimal_flashcard_count)]
                 }
                 
             log("Successfully generated educational content")
             key_points_list = content_data.get("keyPoints", []) # Get the key points
+            log(f"Final content: {len(content_data.get('flashcards', []))} flashcards, {len(key_points_list)} key points")
             report_progress(PROGRESS_CONTENT_GEN_END, "generating_keypoints", "Generated summary and key points.") # Update stage
 
             # --- Process segments ---
@@ -897,8 +953,8 @@ async def process_audio(audio_data: bytes, filename: str):
             return {
                 "status": "success",
                 "summary": content_data["summary"],
-                "keyPoints": content_data["keyPoints"][:5],
-                "flashcards": content_data["flashcards"][:5],
+                "keyPoints": content_data["keyPoints"],
+                "flashcards": content_data["flashcards"],
                 "transcript": transcript,
                 "segments": analyzed_segments,
                 "stats": stats
@@ -1046,6 +1102,12 @@ async def process_video(video_data: bytes, filename: str):
             log("Generating educational content...")
             client = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
+            # Calculate optimal number of flashcards based on content
+            optimal_flashcard_count = calculate_optimal_flashcard_count(segments, transcript)
+            
+            # Adjust key points count based on flashcard count (minimum 3, scale with flashcards)
+            key_points_count = max(3, min(optimal_flashcard_count, 8))
+
             content_prompt = f"""Extract the core educational value from this transcript and return as JSON.
 
             ANALYSIS REQUIREMENTS:
@@ -1059,28 +1121,27 @@ async def process_video(video_data: bytes, filename: str):
             {{
                 "summary": "Clear, concise 2-paragraph summary of core concepts only",
                 "keyPoints": [
-                    "5 essential insights that represent the most important takeaways",
-                    ...4 more key points...
+                    "{key_points_count} essential insights that represent the most important takeaways"
                 ],
                 "flashcards": [
                     {{
                         "question": "Conceptual question testing understanding",
                         "answer": "Precise, factual answer focusing on core concept"
-                    }},
-                    ...4 more flashcards covering different concepts...
+                    }}
+                    ...exactly {optimal_flashcard_count} flashcards covering different concepts, ensuring comprehensive coverage of the material...
                 ]
             }}
 
             TRANSCRIPT:
             {transcript[:4000]}"""  # Limit transcript length to avoid token limits
 
-            log("Generating educational content with OpenAI...")
+            log(f"Generating educational content with {optimal_flashcard_count} flashcards and {key_points_count} key points...")
             content_response = client.chat.completions.create(
                 model="gpt-4.1-nano-2025-04-14",
                 messages=[
                     {
                         "role": "system",
-                        "content": "You are an expert at analyzing educational content and returning results in JSON format. Always respond with valid JSON that matches the requested structure."
+                        "content": f"You are an expert at analyzing educational content and returning results in JSON format. Generate exactly {optimal_flashcard_count} diverse flashcards that comprehensively cover the material. Always respond with valid JSON matching the requested structure."
                     },
                     {
                         "role": "user",
@@ -1088,7 +1149,7 @@ async def process_video(video_data: bytes, filename: str):
                     }
                 ],
                 temperature=0.5,
-                max_tokens=2000,
+                max_tokens=3000,  # Increased token limit to accommodate more flashcards
                 response_format={"type": "json_object"}
             )
 
@@ -1106,17 +1167,30 @@ async def process_video(video_data: bytes, filename: str):
                     
                 if not isinstance(content_data["flashcards"], list) or len(content_data["flashcards"]) == 0:
                     raise ValueError("Invalid or empty flashcards in response")
+                
+                # Log the actual counts vs expected
+                actual_flashcards = len(content_data["flashcards"])
+                actual_keypoints = len(content_data["keyPoints"])
+                log(f"Generated {actual_flashcards} flashcards (expected {optimal_flashcard_count}) and {actual_keypoints} key points (expected {key_points_count})")
+                
+                # Warn if counts don't match but don't fail - the API did its best
+                if actual_flashcards != optimal_flashcard_count:
+                    log(f"Warning: Got {actual_flashcards} flashcards instead of requested {optimal_flashcard_count}", "WARNING")
+                if actual_keypoints != key_points_count:
+                    log(f"Warning: Got {actual_keypoints} key points instead of requested {key_points_count}", "WARNING")
                     
             except (json.JSONDecodeError, KeyError, IndexError, ValueError) as e:
                 log(f"Error parsing OpenAI response: {str(e)}", "ERROR")
+                # Create fallback content with the optimal counts
                 content_data = {
-                    "summary": "Error generating summary",
-                    "keyPoints": ["Error generating key points"],
-                    "flashcards": [{"question": "Error", "answer": "Error generating flashcards"}]
+                    "summary": "Error generating summary - content analysis failed",
+                    "keyPoints": [f"Key point {i+1}: Error generating content" for i in range(key_points_count)],
+                    "flashcards": [{"question": f"Question {i+1}: Error generating content", "answer": f"Answer {i+1}: Error generating content"} for i in range(optimal_flashcard_count)]
                 }
                 
             log("Successfully generated educational content")
             key_points_list = content_data.get("keyPoints", []) # Get the key points
+            log(f"Final content: {len(content_data.get('flashcards', []))} flashcards, {len(key_points_list)} key points")
             report_progress(PROGRESS_CONTENT_GEN_END, "generating_keypoints", "Generated summary and key points.") # Update stage
 
             # --- Process segments ---
@@ -1145,8 +1219,8 @@ async def process_video(video_data: bytes, filename: str):
             return {
                 "status": "success",
                 "summary": content_data["summary"],
-                "keyPoints": content_data["keyPoints"][:5],
-                "flashcards": content_data["flashcards"][:5],
+                "keyPoints": content_data["keyPoints"],
+                "flashcards": content_data["flashcards"],
                 "transcript": transcript,
                 "segments": analyzed_segments,
                 "stats": stats
