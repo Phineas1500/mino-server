@@ -13,6 +13,9 @@ const { promises: fsPromises } = require('fs');
 const { v4: uuidv4 } = require('uuid'); // Import uuid for generating job IDs
 const OpenAI = require('openai'); // Added OpenAI
 
+// Import mobile video optimization utilities
+const mobileOptimizer = require('./mobile_video_optimizer');
+
 // --- Define job data directory ---
 const JOB_DATA_DIR = path.join(__dirname, '..', 'jobdata');
 
@@ -578,7 +581,7 @@ app.post('/process/s3-video', async (req, res) => {
 
 // --- Modified YouTube URL Processing Endpoint (Fully Asynchronous) ---
 app.post('/process/youtube-url', async (req, res) => {
-  const { youtubeUrl } = req.body;
+  const { youtubeUrl, enhancedMobileOptimization = false } = req.body;
   let tempVideoPath; // Keep track for cleanup in background task
   let fileKey; // Keep track for cleanup/locking in background task
 
@@ -655,6 +658,22 @@ app.post('/process/youtube-url', async (req, res) => {
               const ytdlpProcess = spawn('yt-dlp', config.args);
               let ytdlpError = '';
 
+              // Set a timeout for this specific attempt (3 minutes per attempt)
+              const attemptTimeout = setTimeout(() => {
+                console.log(`[Job ${jobId}] Attempt ${attemptNumber} timed out, terminating...`);
+                ytdlpProcess.kill('SIGTERM');
+                
+                // Force kill if needed
+                setTimeout(() => {
+                  if (!ytdlpProcess.killed) {
+                    console.log(`[Job ${jobId}] Force killing attempt ${attemptNumber}...`);
+                    ytdlpProcess.kill('SIGKILL');
+                  }
+                }, 5000);
+                
+                resolve({ success: false, code: 'TIMEOUT', error: 'Download attempt timed out', attempt: attemptNumber });
+              }, 3 * 60 * 1000); // 3 minutes per attempt
+
               ytdlpProcess.stderr.on('data', (data) => {
                 const stderrText = data.toString();
                 console.log(`[Job ${jobId}] yt-dlp stderr (attempt ${attemptNumber}): ${stderrText.trim()}`);
@@ -674,6 +693,7 @@ app.post('/process/youtube-url', async (req, res) => {
               });
 
               ytdlpProcess.on('close', (code) => {
+                clearTimeout(attemptTimeout);
                 if (code === 0) {
                   resolve({ success: true, attempt: attemptNumber });
                 } else {
@@ -682,45 +702,59 @@ app.post('/process/youtube-url', async (req, res) => {
               });
 
               ytdlpProcess.on('error', (err) => {
-                reject({ success: false, error: err.message, attempt: attemptNumber });
+                clearTimeout(attemptTimeout);
+                resolve({ success: false, error: err.message, attempt: attemptNumber });
               });
             });
           };
 
-          // Define different download configurations with fallbacks
+          // Define different download configurations with fallbacks for mobile compatibility
+          // Updated to use the simpler, more robust approach from our CLI testing
+          // These configurations are based on successful testing and avoid complex format strings
+          // that cause "Requested format is not available" errors
           const downloadConfigs = [
             {
-              name: 'basic_audio_video',
+              name: 'mobile_optimized_simple',
               args: [
-                '--format', 'bestaudio+bestvideo/best',  // Try to merge audio+video or get best with audio
-                '--merge-output-format', 'mp4',
-                '--no-warnings',
-                '-o', tempVideoPath,
-                '--', youtubeUrl
-              ]
-            },
-            {
-              name: 'optimized',
-              args: [
-                '-f', 'best[height<=720][acodec!=none]/best[height<=1080][acodec!=none]/best[acodec!=none]',  // Ensure audio is present
+                '--format', 'bestvideo[vcodec*=avc1][height<=720]+bestaudio/best[height<=720]/best',
                 '--merge-output-format', 'mp4',
                 '--prefer-ffmpeg',
-                '--postprocessor-args', 'ffmpeg:-c:v libx264 -c:a aac -movflags +faststart',
                 '--no-warnings',
-                '--ignore-errors',
-                '--extract-flat', 'false',
                 '--no-playlist',
+                '--abort-on-unavailable-fragment',
+                '--fragment-retries', '3',
+                '--socket-timeout', '30',
+                '--retries', '3',
                 '-o', tempVideoPath,
                 '--progress',
                 '--', youtubeUrl
               ]
             },
             {
-              name: 'simple',
+              name: 'mobile_fallback_mp4',
               args: [
-                '-f', 'best[acodec!=none]/worst[acodec!=none]',  // Ensure audio is present
+                '--format', 'best[ext=mp4][height<=720]/best[height<=720]/best',
                 '--merge-output-format', 'mp4',
+                '--prefer-ffmpeg',
                 '--no-warnings',
+                '--abort-on-unavailable-fragment',
+                '--fragment-retries', '2',
+                '--socket-timeout', '30',
+                '--retries', '2',
+                '-o', tempVideoPath,
+                '--progress',
+                '--', youtubeUrl
+              ]
+            },
+            {
+              name: 'simple_best_mobile',
+              args: [
+                '--format', 'best[height<=720]/best',
+                '--merge-output-format', 'mp4',
+                '--prefer-ffmpeg',
+                '--no-warnings',
+                '--socket-timeout', '30',
+                '--retries', '1',
                 '-o', tempVideoPath,
                 '--progress',
                 '--', youtubeUrl
@@ -765,6 +799,36 @@ app.post('/process/youtube-url', async (req, res) => {
               `Consider updating yt-dlp: pip install --upgrade yt-dlp`;
             throw new Error(errorMessage);
           }
+
+          // --- Enhanced Mobile Optimization (if requested) ---
+          if (enhancedMobileOptimization) {
+            await updateYoutubeJobStatus('mobile_optimization', 18, 'Performing enhanced mobile optimization...');
+            
+            try {
+              // Check if the downloaded video needs mobile optimization
+              const compatibility = await mobileOptimizer.checkMobileCompatibility(tempVideoPath);
+              
+              if (!compatibility.isCompatible) {
+                console.log(`[Job ${jobId}] Video needs mobile optimization. Issues: ${compatibility.issues.join(', ')}`);
+                
+                // Create optimized version
+                const optimizedPath = tempVideoPath.replace('.mp4', '-mobile-optimized.mp4');
+                await mobileOptimizer.optimizeForMobile(tempVideoPath, optimizedPath);
+                
+                // Replace the original with the optimized version
+                await fsPromises.unlink(tempVideoPath);
+                await fsPromises.rename(optimizedPath, tempVideoPath);
+                
+                console.log(`[Job ${jobId}] Enhanced mobile optimization completed`);
+              } else {
+                console.log(`[Job ${jobId}] Video is already mobile-compatible, skipping optimization`);
+              }
+            } catch (optimizationError) {
+              console.warn(`[Job ${jobId}] Enhanced mobile optimization failed, continuing with original: ${optimizationError.message}`);
+              // Continue with original video if optimization fails
+            }
+          }
+
           await updateYoutubeJobStatus('uploading_to_s3', 20, 'Uploading video to storage...'); // Example: 20%
 
           // --- Upload to S3 ---
@@ -890,6 +954,221 @@ app.get('/process/status/:jobId', async (req, res) => {
   const { details, ...jobStatusToSend } = job;
 
   res.json(jobStatusToSend);
+});
+
+// --- Mobile Compatibility Check Endpoint ---
+app.post('/api/mobile/check-compatibility', async (req, res) => {
+  const { fileKey } = req.body;
+
+  if (!fileKey) {
+    return res.status(400).json({ error: 'fileKey is required' });
+  }
+
+  try {
+    // Download file from S3 temporarily for analysis
+    const tempDir = path.join(__dirname, '..', 'temp');
+    await fsPromises.mkdir(tempDir, { recursive: true });
+    const tempFilePath = path.join(tempDir, `temp-${Date.now()}-${path.basename(fileKey)}`);
+
+    const getCommand = new GetObjectCommand({
+      Bucket: process.env.AWS_BUCKET_NAME,
+      Key: fileKey
+    });
+
+    const response = await s3Client.send(getCommand);
+    const writeStream = fs.createWriteStream(tempFilePath);
+
+    await new Promise((resolve, reject) => {
+      response.Body.pipe(writeStream);
+      writeStream.on('finish', resolve);
+      writeStream.on('error', reject);
+    });
+
+    // Check mobile compatibility
+    const analysis = await mobileOptimizer.checkMobileCompatibility(tempFilePath);
+
+    // Cleanup temp file
+    await fsPromises.unlink(tempFilePath);
+
+    res.json({
+      success: true,
+      compatibility: analysis
+    });
+
+  } catch (error) {
+    console.error('Error checking mobile compatibility:', error);
+    res.status(500).json({
+      error: 'Failed to check mobile compatibility',
+      details: error.message
+    });
+  }
+});
+
+// --- Mobile Video Optimization Endpoint ---
+app.post('/api/mobile/optimize-video', async (req, res) => {
+  const { fileKey } = req.body;
+
+  if (!fileKey) {
+    return res.status(400).json({ error: 'fileKey is required' });
+  }
+
+  // Generate Job ID for optimization process
+  const jobId = uuidv4();
+
+  try {
+    // Store initial job state
+    const initialJobData = {
+      status: 'processing',
+      stage: 'pending',
+      progress: 5,
+      message: 'Mobile optimization request received...',
+      startTime: Date.now(),
+      source: 'mobile-optimization',
+      originalFileKey: fileKey
+    };
+
+    await writeJobData(jobId, initialJobData);
+
+    // Return job ID immediately
+    res.status(202).json({ jobId: jobId });
+
+    // Start background optimization
+    (async () => {
+      try {
+        const updateOptimizationStatus = async (stage, progress, message = null) => {
+          try {
+            const currentJob = await readJobData(jobId) || {};
+            const updatedJob = {
+              ...currentJob,
+              status: 'processing',
+              stage: stage,
+              progress: progress,
+              ...(message && { message: message })
+            };
+            await writeJobData(jobId, updatedJob);
+            console.log(`[Job ${jobId}] Mobile Optimization Status: Stage=${stage}, Progress=${progress}%`);
+          } catch (error) {
+            console.error(`[Job ${jobId}] Failed to update optimization status:`, error);
+          }
+        };
+
+        await updateOptimizationStatus('downloading', 10, 'Downloading video for optimization...');
+
+        // Download original file from S3
+        const tempDir = path.join(__dirname, '..', 'temp');
+        await fsPromises.mkdir(tempDir, { recursive: true });
+        const inputPath = path.join(tempDir, `input-${jobId}-${path.basename(fileKey)}`);
+        const outputPath = path.join(tempDir, `optimized-${jobId}.mp4`);
+
+        const getCommand = new GetObjectCommand({
+          Bucket: process.env.AWS_BUCKET_NAME,
+          Key: fileKey
+        });
+
+        const response = await s3Client.send(getCommand);
+        const writeStream = fs.createWriteStream(inputPath);
+
+        await new Promise((resolve, reject) => {
+          response.Body.pipe(writeStream);
+          writeStream.on('finish', resolve);
+          writeStream.on('error', reject);
+        });
+
+        await updateOptimizationStatus('analyzing', 20, 'Analyzing video compatibility...');
+
+        // Check current compatibility
+        const analysis = await mobileOptimizer.checkMobileCompatibility(inputPath);
+
+        if (analysis.isCompatible) {
+          await updateOptimizationStatus('complete', 100, 'Video is already mobile-compatible');
+          
+          // Update job as complete without optimization
+          const completeData = {
+            status: 'complete',
+            stage: 'complete',
+            progress: 100,
+            message: 'Video was already mobile-compatible',
+            data: {
+              originalFileKey: fileKey,
+              optimizedFileKey: fileKey, // Same file
+              compatibility: analysis,
+              optimizationPerformed: false
+            },
+            endTime: Date.now()
+          };
+          await writeJobData(jobId, completeData);
+
+          // Cleanup
+          await fsPromises.unlink(inputPath);
+          return;
+        }
+
+        await updateOptimizationStatus('optimizing', 30, 'Optimizing video for mobile compatibility...');
+
+        // Perform mobile optimization
+        await mobileOptimizer.optimizeForMobile(inputPath, outputPath);
+
+        await updateOptimizationStatus('uploading', 80, 'Uploading optimized video...');
+
+        // Upload optimized file to S3
+        const optimizedFileKey = `optimized/${path.basename(outputPath)}`;
+        const fileStream = fs.createReadStream(outputPath);
+        const uploadCommand = new PutObjectCommand({
+          Bucket: process.env.AWS_BUCKET_NAME,
+          Key: optimizedFileKey,
+          Body: fileStream,
+          ContentType: 'video/mp4'
+        });
+
+        await s3Client.send(uploadCommand);
+
+        await updateOptimizationStatus('verifying', 90, 'Verifying optimization...');
+
+        // Verify the optimized video
+        const newAnalysis = await mobileOptimizer.checkMobileCompatibility(outputPath);
+
+        // Complete the job
+        const completeData = {
+          status: 'complete',
+          stage: 'complete',
+          progress: 100,
+          message: 'Mobile optimization completed successfully',
+          data: {
+            originalFileKey: fileKey,
+            optimizedFileKey: optimizedFileKey,
+            originalCompatibility: analysis,
+            optimizedCompatibility: newAnalysis,
+            optimizationPerformed: true
+          },
+          endTime: Date.now()
+        };
+        await writeJobData(jobId, completeData);
+
+        // Cleanup temp files
+        await fsPromises.unlink(inputPath);
+        await fsPromises.unlink(outputPath);
+
+        console.log(`[Job ${jobId}] Mobile optimization completed successfully`);
+
+      } catch (error) {
+        console.error(`[Job ${jobId}] Error during mobile optimization:`, error);
+        
+        const errorData = {
+          status: 'error',
+          stage: 'error',
+          progress: 0,
+          message: `Mobile optimization failed: ${error.message}`,
+          details: error.stack,
+          endTime: Date.now()
+        };
+        await writeJobData(jobId, errorData);
+      }
+    })();
+
+  } catch (error) {
+    console.error(`[Job ${jobId}] Failed to initialize mobile optimization:`, error);
+    res.status(500).json({ error: 'Failed to initialize mobile optimization job.' });
+  }
 });
 
 // --- Chat API Endpoint ---
