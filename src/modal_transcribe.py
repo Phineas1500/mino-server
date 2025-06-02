@@ -761,7 +761,7 @@ async def optimize_playback_speed(segments):
         }
 
 @app.function(
-    gpu="T4",
+    gpu="A10G",
     image=image,
     timeout=1800,
     secrets=[Secret.from_name("openai-secret")]
